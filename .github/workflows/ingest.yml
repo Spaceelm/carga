@@ -1,0 +1,209 @@
+name: Ingest chargers
+
+# Scheduled ingest of the national EV NAP feeds into Upstash Redis.
+#
+# This repo is PUBLIC, so GitHub-hosted Actions minutes are free and unmetered — the
+# cadences below are therefore set by the limits that DO still bind:
+#   1. Upstash Redis: 500k commands/month (shared with the web app's read path).
+#   2. Upstream politeness: each PT status run pulls MOBI.E's ~40 MB evActualStatus
+#      feed; REVE's official API is documented at ~5 req/hr. Being throttled or
+#      blocked upstream would break live availability in the app, so we stay modest.
+#   3. GitHub crons have 5-min granularity and are queued (often 5-20 min late) under
+#      load, so anything under ~15 min is unreliable anyway.
+#
+# Credentials come from repo Secrets. Forks never receive secrets, and scheduled runs
+# only ever execute on the default branch, so a public repo is safe here.
+
+on:
+  schedule:
+    # Full refresh (all countries) — daily 04:00 UTC, after MOBI.E's ~03:00 publish.
+    # Refreshes PT static + OPC prices, runs the mark-and-sweep, advances the ES crawl.
+    - cron: '0 4 * * *'
+    # Status-only refresh (PT) — every 15 min. The expensive MGET-all + history roll is
+    # gated to once per hour inside run.js; the other runs take the cheap delta path
+    # (~6 Redis commands), which is what makes this cadence affordable.
+    - cron: '*/15 * * * *'
+    # Status-only sweep (ES) — hourly at :05 (staggered off the PT runs). The
+    # availability history buckets per UTC hour, so sweeping more often would add no
+    # resolution — only load on REVE.
+    - cron: '5 * * * *'
+    # Resumable ES full-crawl chunk — every 3h at :25. REVE /locations is rate-limited
+    # (~5 req/hr) and crawled a few checkpointed pages per run; 3h advances the cycle
+    # ~3x faster than before while staying inside that budget.
+    - cron: '25 */3 * * *'
+    # Heartbeat — 1st of the month. GitHub disables scheduled workflows in PUBLIC repos
+    # after 60 days of no repository activity; a monthly commit resets that clock.
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+    inputs:
+      country:
+        description: 'Country code (ISO alpha-2). "all" = every configured country.'
+        required: false
+        default: 'all'
+      mode:
+        description: 'Refresh mode'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - status-only
+      dry_run:
+        description: 'Dry run (no writes)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # Never let a status run and a full run write concurrently.
+  group: ingest-chargers
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Full refresh — daily 04:00Z cron, and manual dispatch when mode=full. Matrix over
+  # both countries; a dispatch targeting one country no-ops the other leg (guard below).
+  # PT -> mobie, ES -> reve (registered in providers/index.js).
+  # ---------------------------------------------------------------------------
+  full:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 4 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        country: [PT, ES]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ingest (full)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          # ES static registry (REVE official OCPI API). Only the ES matrix leg uses it.
+          REVE_API_KEY: ${{ secrets.REVE_API_KEY }}
+          # Give the large (~183 MB) static parse headroom.
+          NODE_OPTIONS: '--max-old-space-size=2048'
+          MATRIX_COUNTRY: ${{ matrix.country }}
+          DISPATCH_COUNTRY: ${{ github.event.inputs.country }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ -n "$DISPATCH_COUNTRY" ] && [ "$DISPATCH_COUNTRY" != "all" ] \
+             && [ "$DISPATCH_COUNTRY" != "$MATRIX_COUNTRY" ]; then
+            echo "Skipping $MATRIX_COUNTRY (dispatch targeted $DISPATCH_COUNTRY)."
+            exit 0
+          fi
+          DRY_RUN=""
+          if [ "$DRY_RUN_INPUT" = "true" ]; then DRY_RUN="--dry-run"; fi
+          echo "Full refresh: country=$MATRIX_COUNTRY dry_run='$DRY_RUN'"
+          node scripts/ingest/run.js --country="$MATRIX_COUNTRY" $DRY_RUN
+
+  # ---------------------------------------------------------------------------
+  # Resumable ES full-crawl chunk — every 3h at :25. Advances the checkpointed REVE
+  # /locations crawl a few pages per run; no write until the crawl reaches its final
+  # page, then one upsert+sweep. Shares the ingest concurrency group.
+  # ---------------------------------------------------------------------------
+  full_es_crawl:
+    if: github.event_name == 'schedule' && github.event.schedule == '25 */3 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ingest (ES full-crawl chunk)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          REVE_API_KEY: ${{ secrets.REVE_API_KEY }}
+          NODE_OPTIONS: '--max-old-space-size=2048'
+        run: node scripts/ingest/run.js --country=ES
+
+  # ---------------------------------------------------------------------------
+  # Status-only refresh (PT) — every 15 min, and manual dispatch when
+  # mode=status-only (which may target ES, routed to the REVE area sweep).
+  # ---------------------------------------------------------------------------
+  status:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status-only')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ingest (status-only)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          DISPATCH_COUNTRY: ${{ github.event.inputs.country }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+        run: |
+          COUNTRY="PT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ -n "$DISPATCH_COUNTRY" ] && [ "$DISPATCH_COUNTRY" != "all" ]; then
+            COUNTRY="$DISPATCH_COUNTRY"
+          fi
+          DRY_RUN=""
+          if [ "$DRY_RUN_INPUT" = "true" ]; then DRY_RUN="--dry-run"; fi
+          echo "Status-only refresh: country=$COUNTRY dry_run='$DRY_RUN'"
+          node scripts/ingest/run.js --country="$COUNTRY" --status-only $DRY_RUN
+
+  # ---------------------------------------------------------------------------
+  # Status-only sweep (ES) — hourly at :05. REVE has no bulk status feed, so run.js
+  # routes ES to the provider's area sweep (tiles REVE /markers over populated Spain,
+  # matches to stations, accumulates availability history).
+  # ---------------------------------------------------------------------------
+  status_es:
+    if: github.event_name == 'schedule' && github.event.schedule == '5 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ingest (ES status sweep)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: node scripts/ingest/run.js --country=ES --status-only
+
+  # ---------------------------------------------------------------------------
+  # Heartbeat — monthly commit so GitHub doesn't auto-disable the schedules above
+  # (public repos lose their crons after 60 days of no repository activity).
+  # ---------------------------------------------------------------------------
+  heartbeat:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch heartbeat and commit
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/heartbeat.txt
+          git commit -m "chore: heartbeat (keep scheduled workflows enabled)" || exit 0
+          git push

@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns7:payload xmlns="http://datex2.eu/schema/3/common" xmlns:ns2="http://datex2.eu/schema/3/locationExtension" xmlns:ns3="http://datex2.eu/schema/3/locationReferencing" xmlns:ns4="http://datex2.eu/schema/3/facilities" xmlns:ns5="http://datex2.eu/schema/3/commonExtension" xmlns:ns6="http://datex2.eu/schema/3/energyInfrastructure" xmlns:ns7="http://datex2.eu/schema/3/d2Payload" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="ns6:EnergyInfrastructureTablePublication" lang="pt" modelBaseVersion="3">
+    <publicationTime>2026-07-05T03:00:04.566Z</publicationTime>
+    <publicationCreator>
+        <country>PT</country>
+        <nationalIdentifier>MOBIE</nationalIdentifier>
+    </publicationCreator>
+    <ns6:energyInfrastructureTable id="1" version="1">
+        <ns6:energyInfrastructureSite id="EZC-AMD-00051" version="1">
+            <ns4:name>
+                <values>
+                    <value lang="pt-pt">AMD-00051</value>
+                </values>
+            </ns4:name>
+            <ns4:externalIdentifier>AMD-00051</ns4:externalIdentifier>
+            <ns4:lastUpdated>2026-07-05T02:58:57.773Z</ns4:lastUpdated>
+            <ns4:operatingHours xsi:type="ns4:OperatingHoursSpecification" id="1" version="1">
+                <ns4:overallPeriod>
+                    <overallStartTime>2022-08-24T09:26:54.524Z</overallStartTime>
+                </ns4:overallPeriod>
+            </ns4:operatingHours>
+            <ns4:locationReference xsi:type="ns3:PointLocation">
+                <ns3:_locationReferenceExtension>
+                    <ns3:facilityLocation>
+                        <ns2:timeZone>+01:00</ns2:timeZone>
+                        <ns2:address>
+                            <ns2:postcode>2650-114</ns2:postcode>
+                            <ns2:city>
+                                <values>
+                                    <value lang="pt-pt">Amadora</value>
+                                </values>
+                            </ns2:city>
+                            <ns2:countryCode>PT</ns2:countryCode>
+                            <ns2:addressLine order="0">
+                                <ns2:type>street</ns2:type>
+                                <ns2:text>
+                                    <values>
+                                        <value lang="pt-pt">Estrada Santo Eloi, 25</value>
+                                    </values>
+                                </ns2:text>
+                            </ns2:addressLine>
+                        </ns2:address>
+                    </ns3:facilityLocation>
+                </ns3:_locationReferenceExtension>
+                <ns3:supplementaryPositionalDescription>
+                    <ns3:namedArea xsi:type="ns3:NutsNamedArea">
+                        <ns3:areaName>
+                            <values>
+                                <value lang="pt-pt">Amadora</value>
+                            </values>
+                        </ns3:areaName>
+                        <ns3:nutsCodeType>nuts1Code</ns3:nutsCodeType>
+                        <ns3:nutsCode>PT1</ns3:nutsCode>
+                    </ns3:namedArea>
+                </ns3:supplementaryPositionalDescription>
+                <ns3:pointByCoordinates>
+                    <ns3:pointCoordinates>
+                        <ns3:latitude>38.78791</ns3:latitude>
+                        <ns3:longitude>-9.226767</ns3:longitude>
+                    </ns3:pointCoordinates>
+                </ns3:pointByCoordinates>
+            </ns4:locationReference>
+            <ns4:operator xsi:type="ns4:OrganisationSpecification" id="EZC3" version="1">
+                <ns4:name>
+                    <values>
+                        <value lang="pt-pt">EZ - CHARG3, Lda </value>
+                    </values>
+                </ns4:name>
+                <ns4:linkToGeneralInformation>https://ez-charg3.com</ns4:linkToGeneralInformation>
+                <ns4:nationalOrganisationNumber>EZC3</ns4:nationalOrganisationNumber>
+                <ns4:organisationUnit>
+                    <ns4:contactInformation>
+                        <ns4:telephoneNumber>918590002</ns4:telephoneNumber>
+                    </ns4:contactInformation>
+                </ns4:organisationUnit>
+            </ns4:operator>
+            <ns6:energyInfrastructureStation id="EZC-AMD-00051" version="1">
+                <ns6:authenticationAndIdentificationMethods>apps</ns6:authenticationAndIdentificationMethods>
+                <ns6:authenticationAndIdentificationMethods>rfid</ns6:authenticationAndIdentificationMethods>
+                <ns6:authenticationAndIdentificationMethods>creditcard</ns6:authenticationAndIdentificationMethods>
+                <ns6:refillPoint xsi:type="ns6:ElectricChargingPoint" id="AMD-00051-1" version="1">
+                    <ns4:externalIdentifier>PT*EZC*E*AMD*00051*1</ns4:externalIdentifier>
+                    <ns6:usageType>electricVehicle</ns6:usageType>
+                    <ns6:connector>
+                        <ns6:connectorType>iec62196T2</ns6:connectorType>
+                        <ns6:chargingMode>mode3AC3p</ns6:chargingMode>
+                        <ns6:connectorFormat>socket</ns6:connectorFormat>
+                        <ns6:maxPowerAtSocket>11000.0</ns6:maxPowerAtSocket>
+                        <ns6:voltage>400.0</ns6:voltage>
+                        <ns6:maximumCurrent>16.0</ns6:maximumCurrent>
+                    </ns6:connector>
+                    <ns6:electricEnergyMix energyMixIndex="1">
+                        <ns6:isGreenEnergy>false</ns6:isGreenEnergy>
+                    </ns6:electricEnergyMix>
+                </ns6:refillPoint>
+                <ns6:serviceType/>
+            </ns6:energyInfrastructureStation>
+        </ns6:energyInfrastructureSite>
+        <ns6:energyInfrastructureSite id="SGM-GMR-00022" version="1">
+            <ns4:name>
+                <values>
+                    <value lang="pt-pt">GMR-00022</value>
+                </values>
+            </ns4:name>
+            <ns4:externalIdentifier>GMR-00022</ns4:externalIdentifier>
+            <ns4:lastUpdated>2026-07-05T02:58:04.977Z</ns4:lastUpdated>
+            <ns4:operatingHours xsi:type="ns4:OpenAllHours"/>
+            <ns4:locationReference xsi:type="ns3:PointLocation">
+                <ns3:_locationReferenceExtension>
+                    <ns3:facilityLocation>
+                        <ns2:timeZone>+01:00</ns2:timeZone>
+                        <ns2:address>
+                            <ns2:postcode>4810-107</ns2:postcode>
+                            <ns2:city>
+                                <values>
+                                    <value lang="pt-pt">Guimarães</value>
+                                </values>
+                            </ns2:city>
+                            <ns2:countryCode>PT</ns2:countryCode>
+                            <ns2:addressLine order="0">
+                                <ns2:type>street</ns2:type>
+                                <ns2:text>
+                                    <values>
+                                        <value lang="pt-pt">Rua de São Gonçalo, 100</value>
+                                    </values>
+                                </ns2:text>
+                            </ns2:addressLine>
+                        </ns2:address>
+                    </ns3:facilityLocation>
+                </ns3:_locationReferenceExtension>
+                <ns3:pointByCoordinates>
+                    <ns3:pointCoordinates>
+                        <ns3:latitude>41.44443</ns3:latitude>
+                        <ns3:longitude>-8.29619</ns3:longitude>
+                    </ns3:pointCoordinates>
+                </ns3:pointByCoordinates>
+            </ns4:locationReference>
+            <ns4:operator xsi:type="ns4:OrganisationSpecification" id="SGM1" version="1">
+                <ns4:name>
+                    <values>
+                        <value lang="pt-pt">São Gonçalo Mobilidade</value>
+                    </values>
+                </ns4:name>
+                <ns4:nationalOrganisationNumber>SGM1</ns4:nationalOrganisationNumber>
+            </ns4:operator>
+            <ns6:energyInfrastructureStation id="SGM-GMR-00022" version="1">
+                <ns6:refillPoint xsi:type="ns6:ElectricChargingPoint" id="GMR-00022-01" version="1">
+                    <ns4:externalIdentifier>PT*SGM*E*GMR*00022*01</ns4:externalIdentifier>
+                    <ns6:usageType>electricVehicle</ns6:usageType>
+                    <ns6:connector>
+                        <ns6:connectorType>iec62196T2COMBO</ns6:connectorType>
+                        <ns6:chargingMode>mode4DC</ns6:chargingMode>
+                        <ns6:connectorFormat>cable</ns6:connectorFormat>
+                        <ns6:maxPowerAtSocket>150000.0</ns6:maxPowerAtSocket>
+                        <ns6:voltage>500.0</ns6:voltage>
+                        <ns6:maximumCurrent>300.0</ns6:maximumCurrent>
+                    </ns6:connector>
+                </ns6:refillPoint>
+                <ns6:refillPoint xsi:type="ns6:ElectricChargingPoint" id="GMR-00022-02" version="1">
+                    <ns4:externalIdentifier>PT*SGM*E*GMR*00022*02</ns4:externalIdentifier>
+                    <ns6:usageType>electricVehicle</ns6:usageType>
+                    <ns6:connector>
+                        <ns6:connectorType>chademo</ns6:connectorType>
+                        <ns6:chargingMode>mode4DC</ns6:chargingMode>
+                        <ns6:connectorFormat>cable</ns6:connectorFormat>
+                        <ns6:maxPowerAtSocket>50000.0</ns6:maxPowerAtSocket>
+                        <ns6:voltage>400.0</ns6:voltage>
+                        <ns6:maximumCurrent>125.0</ns6:maximumCurrent>
+                    </ns6:connector>
+                </ns6:refillPoint>
+            </ns6:energyInfrastructureStation>
+        </ns6:energyInfrastructureSite>
+        <ns6:energyInfrastructureSite id="NOCOORDS-00099" version="1">
+            <ns4:name>
+                <values>
+                    <value lang="pt-pt">Sem Coordenadas</value>
+                </values>
+            </ns4:name>
+            <ns4:externalIdentifier>NOCOORDS-00099</ns4:externalIdentifier>
+            <ns4:lastUpdated>2026-07-05T02:00:00.000Z</ns4:lastUpdated>
+            <ns4:locationReference xsi:type="ns3:PointLocation">
+                <ns3:pointByCoordinates>
+                    <ns3:pointCoordinates>
+                    </ns3:pointCoordinates>
+                </ns3:pointByCoordinates>
+            </ns4:locationReference>
+            <ns6:energyInfrastructureStation id="NOCOORDS-00099" version="1">
+                <ns6:refillPoint xsi:type="ns6:ElectricChargingPoint" id="NOCOORDS-00099-1" version="1">
+                    <ns4:externalIdentifier>PT*XXX*E*NOC*00099*1</ns4:externalIdentifier>
+                    <ns6:connector>
+                        <ns6:connectorType>iec62196T2</ns6:connectorType>
+                        <ns6:maxPowerAtSocket>22000.0</ns6:maxPowerAtSocket>
+                    </ns6:connector>
+                </ns6:refillPoint>
+            </ns6:energyInfrastructureStation>
+        </ns6:energyInfrastructureSite>
+    </ns6:energyInfrastructureTable>
+</ns7:payload>

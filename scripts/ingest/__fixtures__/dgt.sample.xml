@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<d2:payload xmlns:d2="http://datex2.eu/schema/3/d2Payload" xsi:type="egi:EnergyInfrastructureTablePublication" lang="es" modelBaseVersion="3" xmlns:com="http://datex2.eu/schema/3/common" xmlns:loc="http://datex2.eu/schema/3/locationReferencing" xmlns:egi="http://datex2.eu/schema/3/energyInfrastructure" xmlns:fac="http://datex2.eu/schema/3/facilities" xmlns:locx="http://datex2.eu/schema/3/locationExtension" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <com:publicationTime>2026-07-05T10:18:48.111+02:00</com:publicationTime>
+    <com:publicationCreator>
+        <com:country>ES</com:country>
+        <com:nationalIdentifier>dgt</com:nationalIdentifier>
+    </com:publicationCreator>
+    <egi:energyInfrastructureTable id="ELECTROLINERAS" version="20260705">
+        <egi:energyInfrastructureSite id="HQXAC9HN2SYEETBCU5SO" version="">
+            <fac:name>
+                <com:values>
+                    <com:value lang="es">Malecón de la Encantá 3</com:value>
+                </com:values>
+            </fac:name>
+            <fac:lastUpdated>2026-07-01T09:26:42.000+02:00</fac:lastUpdated>
+            <fac:accessibility xsi:nil="true"/>
+            <fac:operatingHours xsi:type="fac:OperatingHoursSpecification" id="24/7" version="">
+                <fac:label/>
+                <fac:overallPeriod>
+                    <com:overallStartTime>2023-01-01T00:00:00.000+01:00</com:overallStartTime>
+                </fac:overallPeriod>
+            </fac:operatingHours>
+            <fac:locationReference xsi:type="loc:PointLocation">
+                <loc:_locationReferenceExtension>
+                    <loc:facilityLocation>
+                        <locx:address>
+                            <locx:postcode>3170</locx:postcode>
+                            <locx:addressLine order="1">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Dirección: Malecón de la Encantá 3</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="2">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Municipio: Rojales</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="3">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Provincia: Alicante/Alacant</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="4">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Comunidad Autónoma: Comunitat Valenciana</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                        </locx:address>
+                    </loc:facilityLocation>
+                </loc:_locationReferenceExtension>
+                <loc:coordinatesForDisplay>
+                    <loc:latitude>38.087696</loc:latitude>
+                    <loc:longitude>-0.72432035</loc:longitude>
+                </loc:coordinatesForDisplay>
+            </fac:locationReference>
+            <fac:operator xsi:type="fac:OrganisationSpecification" id="ES*AEQ" version="">
+                <fac:name>
+                    <com:values>
+                        <com:value lang="es">QWELLO España SL</com:value>
+                    </com:values>
+                </fac:name>
+                <fac:organisationUnit/>
+            </fac:operator>
+            <egi:typeOfSite>onstreet</egi:typeOfSite>
+            <egi:energyInfrastructureStation id="HQXAC9HN2SYEETBCU5SO_1" version="">
+                <egi:authenticationAndIdentificationMethods>debitCard</egi:authenticationAndIdentificationMethods>
+                <egi:authenticationAndIdentificationMethods>rfid</egi:authenticationAndIdentificationMethods>
+                <egi:authenticationAndIdentificationMethods>nfc</egi:authenticationAndIdentificationMethods>
+                <egi:authenticationAndIdentificationMethods>creditCard</egi:authenticationAndIdentificationMethods>
+                <egi:refillPoint xsi:type="egi:ElectricChargingPoint" id="WDXF5ZZ7YDDT0BUEGOQ15JFXLSM" version="">
+                    <fac:name>
+                        <com:values>
+                            <com:value lang="es">ES*AEQ*ESAEQE5PFX311</com:value>
+                        </com:values>
+                    </fac:name>
+                    <egi:connector>
+                        <egi:connectorType>iec62196T2</egi:connectorType>
+                        <egi:chargingMode>mode3AC3p</egi:chargingMode>
+                        <egi:connectorFormat>socket</egi:connectorFormat>
+                        <egi:maxPowerAtSocket>22000.0</egi:maxPowerAtSocket>
+                        <egi:maximumCurrent>32.0</egi:maximumCurrent>
+                    </egi:connector>
+                </egi:refillPoint>
+                <egi:refillPoint xsi:type="egi:ElectricChargingPoint" id="1M7QTK7H6XF3SLSCWM8UIVAO6VV" version="">
+                    <fac:name>
+                        <com:values>
+                            <com:value lang="es">ES*AEQ*ESAEQE5PFX312</com:value>
+                        </com:values>
+                    </fac:name>
+                    <egi:connector>
+                        <egi:connectorType>iec62196T2</egi:connectorType>
+                        <egi:chargingMode>mode3AC3p</egi:chargingMode>
+                        <egi:connectorFormat>socket</egi:connectorFormat>
+                        <egi:maxPowerAtSocket>22000.0</egi:maxPowerAtSocket>
+                        <egi:maximumCurrent>32.0</egi:maximumCurrent>
+                    </egi:connector>
+                </egi:refillPoint>
+            </egi:energyInfrastructureStation>
+        </egi:energyInfrastructureSite>
+        <egi:energyInfrastructureSite id="2025000364" version="">
+            <fac:name>
+                <com:values>
+                    <com:value lang="es">CARREFOUR BADAJOZ VALVERDE</com:value>
+                </com:values>
+            </fac:name>
+            <fac:lastUpdated>2025-09-12T13:48:35.000+02:00</fac:lastUpdated>
+            <fac:accessibility xsi:nil="true"/>
+            <fac:operatingHours xsi:type="fac:OperatingHoursSpecification" id="24/7" version="">
+                <fac:label/>
+                <fac:overallPeriod>
+                    <com:overallStartTime>2023-01-01T00:00:00.000+01:00</com:overallStartTime>
+                </fac:overallPeriod>
+            </fac:operatingHours>
+            <fac:locationReference xsi:type="loc:PointLocation">
+                <loc:_locationReferenceExtension>
+                    <loc:facilityLocation>
+                        <locx:address>
+                            <locx:postcode>6010</locx:postcode>
+                            <locx:addressLine order="1">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Dirección: Ctra. Valverde, km. 1</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="2">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Municipio: Badajoz</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="3">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Provincia: Badajoz</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                            <locx:addressLine order="4">
+                                <locx:type>generalTextLine</locx:type>
+                                <locx:text>
+                                    <com:values>
+                                        <com:value lang="es">Comunidad Autónoma: Extremadura</com:value>
+                                    </com:values>
+                                </locx:text>
+                            </locx:addressLine>
+                        </locx:address>
+                    </loc:facilityLocation>
+                </loc:_locationReferenceExtension>
+                <loc:coordinatesForDisplay>
+                    <loc:latitude>38.861526</loc:latitude>
+                    <loc:longitude>-6.971206</loc:longitude>
+                </loc:coordinatesForDisplay>
+            </fac:locationReference>
+            <fac:operator xsi:type="fac:OrganisationSpecification" id="ES*CRF" version="">
+                <fac:name>
+                    <com:values>
+                        <com:value lang="es">CENTROS COMERCIALES CARREFOUR SA</com:value>
+                    </com:values>
+                </fac:name>
+                <fac:organisationUnit/>
+            </fac:operator>
+            <egi:typeOfSite>openSpace</egi:typeOfSite>
+            <egi:energyInfrastructureStation id="2025000364_1" version="">
+                <egi:authenticationAndIdentificationMethods>creditCard</egi:authenticationAndIdentificationMethods>
+                <egi:refillPoint xsi:type="egi:ElectricChargingPoint" id="COD20250000049157PR00001480" version="">
+                    <fac:name>
+                        <com:values>
+                            <com:value lang="es">ES*CRF*EBDJZVALVERDE</com:value>
+                        </com:values>
+                    </fac:name>
+                    <egi:connector>
+                        <egi:connectorType>iec62196T2COMBO</egi:connectorType>
+                        <egi:chargingMode>mode4DC</egi:chargingMode>
+                        <egi:connectorFormat>cableMode3</egi:connectorFormat>
+                        <egi:maxPowerAtSocket>50000.0</egi:maxPowerAtSocket>
+                    </egi:connector>
+                    <egi:connector>
+                        <egi:connectorType>chademo</egi:connectorType>
+                        <egi:chargingMode>mode4DC</egi:chargingMode>
+                        <egi:connectorFormat>cableMode3</egi:connectorFormat>
+                        <egi:maxPowerAtSocket>50000.0</egi:maxPowerAtSocket>
+                    </egi:connector>
+                </egi:refillPoint>
+            </egi:energyInfrastructureStation>
+        </egi:energyInfrastructureSite>
+        <egi:energyInfrastructureSite id="ESNOCOORDS0001" version="">
+            <fac:name>
+                <com:values>
+                    <com:value lang="es">Sin Coordenadas</com:value>
+                </com:values>
+            </fac:name>
+            <fac:lastUpdated>2026-07-01T00:00:00.000+02:00</fac:lastUpdated>
+            <fac:locationReference xsi:type="loc:PointLocation">
+                <loc:coordinatesForDisplay>
+                </loc:coordinatesForDisplay>
+            </fac:locationReference>
+            <egi:energyInfrastructureStation id="ESNOCOORDS0001_1" version="">
+                <egi:refillPoint xsi:type="egi:ElectricChargingPoint" id="ESNOCOORDSPOINT01" version="">
+                    <fac:name>
+                        <com:values>
+                            <com:value lang="es">ES*XXX*NOCOORDS</com:value>
+                        </com:values>
+                    </fac:name>
+                    <egi:connector>
+                        <egi:connectorType>iec62196T2</egi:connectorType>
+                        <egi:maxPowerAtSocket>22000.0</egi:maxPowerAtSocket>
+                    </egi:connector>
+                </egi:refillPoint>
+            </egi:energyInfrastructureStation>
+        </egi:energyInfrastructureSite>
+    </egi:energyInfrastructureTable>
+</d2:payload>

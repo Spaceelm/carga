@@ -1,0 +1,18 @@
+{
+  "name": "carga-ingest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled ingest of national EV charger feeds (PT MOBI.E, ES REVE/DGT) into Upstash Redis. Runs on GitHub Actions; the carga web app only reads the resulting Redis keyspace.",
+  "scripts": {
+    "ingest": "node scripts/ingest/run.js",
+    "test": "node --test scripts/ingest/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.35.0",
+    "node-fetch": "^2.7.0",
+    "sax": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
