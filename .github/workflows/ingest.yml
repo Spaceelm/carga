@@ -9,20 +9,28 @@ name: Ingest chargers
 #      feed; REVE's official API is documented at ~5 req/hr. Being throttled or
 #      blocked upstream would break live availability in the app, so we stay modest.
 #   3. GitHub crons have 5-min granularity and are queued (often 5-20 min late) under
-#      load, so anything under ~15 min is unreliable anyway.
+#      load, so anything under ~15 min is unreliable anyway. Runs are also dropped
+#      outright when queued at congested times — hence the offset minutes below.
 #
 # Credentials come from repo Secrets. Forks never receive secrets, and scheduled runs
 # only ever execute on the default branch, so a public repo is safe here.
 
 on:
   schedule:
-    # Full refresh (all countries) — daily 04:00 UTC, after MOBI.E's ~03:00 publish.
+    # NOTE ON MINUTES: every cron here deliberately avoids :00 and the other round
+    # quarter-hours. GitHub's shared scheduler is most congested at the top of the hour
+    # and routinely delays or silently DROPS runs queued then, so each schedule sits on
+    # an odd offset. Keep it that way, and keep each job's `if` guard string byte-identical
+    # to its cron below — a mismatch silently disables the job.
+    #
+    # Full refresh (all countries) — daily 04:13 UTC, after MOBI.E's ~03:00 publish.
     # Refreshes PT static + OPC prices, runs the mark-and-sweep, advances the ES crawl.
-    - cron: '0 4 * * *'
-    # Status-only refresh (PT) — every 15 min. The expensive MGET-all + history roll is
-    # gated to once per hour inside run.js; the other runs take the cheap delta path
-    # (~6 Redis commands), which is what makes this cadence affordable.
-    - cron: '*/15 * * * *'
+    - cron: '13 4 * * *'
+    # Status-only refresh (PT) — every ~15 min, offset off the quarter-hours. The
+    # expensive MGET-all + history roll is gated to once per hour inside run.js; the
+    # other runs take the cheap delta path (~6 Redis commands), which is what makes
+    # this cadence affordable.
+    - cron: '7,22,37,52 * * * *'
     # Status-only sweep (ES) — hourly at :05 (staggered off the PT runs). The
     # availability history buckets per UTC hour, so sweeping more often would add no
     # resolution — only load on REVE.
@@ -33,7 +41,7 @@ on:
     - cron: '25 */3 * * *'
     # Heartbeat — 1st of the month. GitHub disables scheduled workflows in PUBLIC repos
     # after 60 days of no repository activity; a monthly commit resets that clock.
-    - cron: '0 3 1 * *'
+    - cron: '41 3 1 * *'
   workflow_dispatch:
     inputs:
       country:
@@ -64,13 +72,13 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Full refresh — daily 04:00Z cron, and manual dispatch when mode=full. Matrix over
+  # Full refresh — daily 04:13Z cron, and manual dispatch when mode=full. Matrix over
   # both countries; a dispatch targeting one country no-ops the other leg (guard below).
   # PT -> mobie, ES -> reve (registered in providers/index.js).
   # ---------------------------------------------------------------------------
   full:
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '0 4 * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '13 4 * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -132,12 +140,12 @@ jobs:
         run: node scripts/ingest/run.js --country=ES
 
   # ---------------------------------------------------------------------------
-  # Status-only refresh (PT) — every 15 min, and manual dispatch when
+  # Status-only refresh (PT) — every ~15 min (:07/:22/:37/:52), and manual dispatch when
   # mode=status-only (which may target ES, routed to the REVE area sweep).
   # ---------------------------------------------------------------------------
   status:
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '7,22,37,52 * * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status-only')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -192,7 +200,7 @@ jobs:
   # (public repos lose their crons after 60 days of no repository activity).
   # ---------------------------------------------------------------------------
   heartbeat:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 3 1 * *'
+    if: github.event_name == 'schedule' && github.event.schedule == '41 3 1 * *'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
