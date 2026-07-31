@@ -35,13 +35,22 @@ on:
     # availability history buckets per UTC hour, so sweeping more often would add no
     # resolution — only load on REVE.
     - cron: '5 * * * *'
+    # Status-only refresh (FR) — every 30 min at :11/:41. Half PT's rate on purpose:
+    # each run pulls the ~9 MB consolidated IRVE dynamique file (cheap) but FR has
+    # ~47k stations vs PT's ~8k, so the periodic MGET-all sweeps dominate the Upstash
+    # budget. The provider also widens its history window to 3h (historyEveryHours),
+    # which is what keeps this affordable — see the budget note in the README.
+    - cron: '11,41 * * * *'
     # Resumable ES full-crawl chunk — every 3h at :25. REVE /locations is rate-limited
     # (~5 req/hr) and crawled a few checkpointed pages per run; 3h advances the cycle
     # ~3x faster than before while staying inside that budget.
     - cron: '25 */3 * * *'
     # Heartbeat — 1st of the month. GitHub disables scheduled workflows in PUBLIC repos
     # after 60 days of no repository activity; a monthly commit resets that clock.
-    - cron: '41 3 1 * *'
+    # Minute :47 is deliberately clear of every ingest slot above (a heartbeat that
+    # collided with a status run could be queued and then cancelled, which would
+    # silently let the schedules expire).
+    - cron: '47 3 1 * *'
   workflow_dispatch:
     inputs:
       country:
@@ -62,10 +71,12 @@ on:
         default: false
         type: boolean
 
-concurrency:
-  # Never let a status run and a full run write concurrently.
-  group: ingest-chargers
-  cancel-in-progress: false
+# NOTE: concurrency is declared PER JOB, not at workflow level, and is keyed by
+# COUNTRY. A single workflow-wide group serialized every country against every
+# other, and GitHub keeps only ONE pending run per group — so with 7-8 recurring
+# runs an hour, a slow leg (FR full: 120 MB download + 165k-row parse) would hold
+# the group and let later arrivals cancel the queued PT status run. Each country's
+# keyspace is independent, so only same-country runs actually need serializing.
 
 permissions:
   contents: read
@@ -81,11 +92,16 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '13 4 * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # Per-country: a full refresh must not run while that country's status run is
+    # writing, but PT's full refresh has no reason to wait for FR's.
+    concurrency:
+      group: ingest-${{ matrix.country }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
-        country: [PT, ES]
+        country: [PT, ES, FR]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -100,7 +116,7 @@ jobs:
           # ES static registry (REVE official OCPI API). Only the ES matrix leg uses it.
           REVE_API_KEY: ${{ secrets.REVE_API_KEY }}
           # Give the large (~183 MB) static parse headroom.
-          NODE_OPTIONS: '--max-old-space-size=2048'
+          NODE_OPTIONS: '--max-old-space-size=4096'
           MATRIX_COUNTRY: ${{ matrix.country }}
           DISPATCH_COUNTRY: ${{ github.event.inputs.country }}
           DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
@@ -124,6 +140,9 @@ jobs:
     if: github.event_name == 'schedule' && github.event.schedule == '25 */3 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: ingest-ES
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -136,7 +155,7 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           REVE_API_KEY: ${{ secrets.REVE_API_KEY }}
-          NODE_OPTIONS: '--max-old-space-size=2048'
+          NODE_OPTIONS: '--max-old-space-size=4096'
         run: node scripts/ingest/run.js --country=ES
 
   # ---------------------------------------------------------------------------
@@ -149,6 +168,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status-only')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: ingest-PT
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -182,6 +204,9 @@ jobs:
     if: github.event_name == 'schedule' && github.event.schedule == '5 * * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: ingest-ES
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -196,13 +221,47 @@ jobs:
         run: node scripts/ingest/run.js --country=ES --status-only
 
   # ---------------------------------------------------------------------------
+  # Status-only refresh (FR) — every 30 min at :11/:41. Pulls the consolidated
+  # "IRVE dynamique" CSV (~9 MB, OCPI-fed via Gireve/QualiCharge) and patches
+  # statuses by id_pdc_itinerance, same id-join shape as PT. Rows older than 24h
+  # are ignored by the provider, so unmaintained producers read as "unknown"
+  # rather than as a stale availability claim.
+  # ---------------------------------------------------------------------------
+  status_fr:
+    if: github.event_name == 'schedule' && github.event.schedule == '11,41 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: ingest-FR
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ingest (FR status)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          NODE_OPTIONS: '--max-old-space-size=4096'
+        run: node scripts/ingest/run.js --country=FR --status-only
+
+  # ---------------------------------------------------------------------------
   # Heartbeat — monthly commit so GitHub doesn't auto-disable the schedules above
   # (public repos lose their crons after 60 days of no repository activity).
   # ---------------------------------------------------------------------------
   heartbeat:
-    if: github.event_name == 'schedule' && github.event.schedule == '41 3 1 * *'
+    if: github.event_name == 'schedule' && github.event.schedule == '47 3 1 * *'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Its own concurrency group: this job writes no Redis data, and it must never
+    # be queued behind (or cancelled by) an ingest run — it is what keeps the
+    # schedules from being auto-disabled.
+    concurrency:
+      group: ingest-heartbeat
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:

@@ -42,6 +42,85 @@ const CRAWL_PAGE_KEY = (cc, n) => `chargers:${cc.toLowerCase()}:crawl:page:${n}`
 
 const PIPELINE_BATCH = 200; // records per pipeline flush
 
+// ---- Chunked JSON values ----------------------------------------------------
+// Upstash's REST API rejects requests over ~1 MB. PT's indexes fit comfortably,
+// but FR's point index / last-feed snapshots (~165k charge points) serialize to
+// several MB. Values at or under CHUNK_CHARS are stored in the plain key exactly
+// as before (PT/ES unchanged, zero migration); larger ones are split into
+// `<key>:c<i>` chunks with a `{"__chunks":N}` sentinel at the base key.
+//
+// Each chunk is stored JSON-encoded (a JSON string of the slice) so the Upstash
+// client's automatic deserialization always yields the slice verbatim — a raw
+// slice that happened to look like a JSON literal (e.g. all digits) would
+// otherwise come back as a number. Slices never split a UTF-16 surrogate pair.
+//
+// Chunks are written BEFORE the sentinel: a crash mid-write leaves the previous
+// sentinel pointing at a mixed set, which fails the reader's integrity checks and
+// returns null — callers treat that as "index missing" and fall back to the
+// always-correct full path. Shrunken writes may strand a few stale `:c` keys;
+// they are unreadable garbage of bounded size, overwritten by the next growth.
+// 400k chars, not ~1M: the cap applies to the REQUEST BODY, which is the slice
+// escaped twice (chunkedSet JSON-encodes each slice, then the client serializes the
+// command). Quote-heavy content can inflate a slice by ~2x, so a 700k threshold
+// could still emit a >1 MB body. 400k keeps the worst case comfortably under the
+// limit at the cost of a few extra SETs per full refresh.
+const CHUNK_CHARS = Math.max(100, parseInt(process.env.INGEST_CHUNK_CHARS || '', 10) || 400000);
+
+function safeParse(s) {
+  try { return JSON.parse(s); } catch (_e) { return null; }
+}
+
+/**
+ * Store `obj` as JSON under `key`, chunking transparently when it exceeds the
+ * Upstash request cap. Returns the number of Redis commands used.
+ */
+async function chunkedSet(redis, key, obj) {
+  const json = JSON.stringify(obj);
+  if (json.length <= CHUNK_CHARS) {
+    await redis.set(key, json);
+    return 1;
+  }
+  const chunks = [];
+  let i = 0;
+  while (i < json.length) {
+    let end = Math.min(i + CHUNK_CHARS, json.length);
+    // Never split a surrogate pair across chunks.
+    const c = end < json.length ? json.charCodeAt(end - 1) : 0;
+    if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+    chunks.push(json.slice(i, end));
+    i = end;
+  }
+  for (let k = 0; k < chunks.length; k++) {
+    await redis.set(`${key}:c${k}`, JSON.stringify(chunks[k]));
+  }
+  await redis.set(key, JSON.stringify({ __chunks: chunks.length }));
+  return chunks.length + 1;
+}
+
+/**
+ * Read a value written by chunkedSet (or a legacy plain SET). Returns the parsed
+ * object, or null when missing/corrupt — callers must treat null as "absent".
+ */
+async function chunkedGet(redis, key) {
+  const base = await redis.get(key);
+  if (base == null) return null;
+  const parsed = typeof base === 'string' ? safeParse(base) : base;
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (!Number.isInteger(parsed.__chunks)) return parsed; // plain (small/legacy) value
+  const n = parsed.__chunks;
+  if (n <= 0 || n > 10000) return null;
+  const parts = await redis.mget(...Array.from({ length: n }, (_, k) => `${key}:c${k}`));
+  const slices = [];
+  for (const p of parts) {
+    if (typeof p !== 'string' || p.length === 0) return null; // missing/mixed chunk
+    // Chunks are JSON-encoded strings; the client may or may not have already
+    // deserialized them. If it still looks like a JSON string, unwrap it.
+    const un = p.charCodeAt(0) === 0x22 ? safeParse(p) : p;
+    slices.push(typeof un === 'string' ? un : p);
+  }
+  return safeParse(slices.join(''));
+}
+
 /**
  * Build a Redis client from env, or throw with a clear message.
  * @returns {import('@upstash/redis').Redis}
@@ -123,7 +202,24 @@ async function writeChargers(chargers, opts) {
         const raw = existing[k];
         if (!raw) continue;
         const prevRec = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        if (prevRec && prevRec.history) slice[k].history = prevRec.history;
+        if (!prevRec) continue;
+        if (prevRec.history) slice[k].history = prevRec.history;
+        // Carry per-connector lastBusyAt ("last used", stamped by the status runs)
+        // forward as well — the freshly-normalized record has no memory of past
+        // sessions, so without this every full refresh would wipe the timestamps.
+        if (Array.isArray(prevRec.connectors)) {
+          const busyByPoint = new Map();
+          for (const pc of prevRec.connectors) {
+            if (pc && pc.pointId && pc.lastBusyAt) busyByPoint.set(String(pc.pointId), pc.lastBusyAt);
+          }
+          if (busyByPoint.size > 0) {
+            for (const nc of slice[k].connectors || []) {
+              if (nc && !nc.lastBusyAt && nc.pointId && busyByPoint.has(String(nc.pointId))) {
+                nc.lastBusyAt = busyByPoint.get(String(nc.pointId));
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -181,8 +277,10 @@ async function writeChargers(chargers, opts) {
 
   // ---- Phase 3: rebuild the auxiliary status indexes (full refresh only) ----
   // These let the frequent status runs avoid MGET-all: pointindex maps each refill
-  // point to its charger (PT diff patch); coordindex gives coords for the ES marker
-  // sweep. Stable until the next full refresh. One SET each (~1 command).
+  // point to its charger (PT/FR diff patch); coordindex gives coords for the ES
+  // marker sweep. Stable until the next full refresh. Written via chunkedSet: one
+  // SET for PT/ES-sized indexes exactly as before; FR's ~165k-point index exceeds
+  // Upstash's ~1 MB request cap and is split transparently (a handful of SETs).
   if (!statusOnly) {
     const pointIndex = {};
     const coordIndex = {};
@@ -194,8 +292,8 @@ async function writeChargers(chargers, opts) {
         if (conn.pointId) pointIndex[String(conn.pointId)] = id;
       }
     }
-    await redis.set(POINTINDEX_KEY(cc), JSON.stringify(pointIndex));
-    await redis.set(COORDINDEX_KEY(cc), JSON.stringify(coordIndex));
+    await chunkedSet(redis, POINTINDEX_KEY(cc), pointIndex);
+    await chunkedSet(redis, COORDINDEX_KEY(cc), coordIndex);
   }
 
   await redis.set(META_KEY(cc), JSON.stringify({
@@ -211,5 +309,7 @@ async function writeChargers(chargers, opts) {
 module.exports = {
   writeChargers,
   makeRedis,
+  chunkedSet,
+  chunkedGet,
   keys: { GEO_KEY, IDS_KEY, META_KEY, CHARGER_KEY, POINTINDEX_KEY, COORDINDEX_KEY, LASTFEED_KEY, CRAWL_KEY, CRAWL_PAGE_KEY },
 };

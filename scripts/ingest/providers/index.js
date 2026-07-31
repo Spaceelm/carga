@@ -12,6 +12,7 @@
 
 const mobie = require('./mobie');
 const reve = require('./reve');
+const fr = require('./fr');
 
 /** @type {Record<string, {name:string, country:string, fetch:Function, normalize:Function, normalizeStreaming:Function}>} */
 const PROVIDERS = {
@@ -19,6 +20,9 @@ const PROVIDERS = {
   // ES static registry: REVE official OCPI API (replaces the DGT DATEX II feed).
   // providers/dgt.js is kept in the tree for reference but is no longer registered.
   ES: reve,
+  // FR: national IRVE open data (transport.data.gouv.fr) — deduplicated static
+  // consolidation + Gireve/QualiCharge-fed dynamic status. No API key.
+  FR: fr,
 };
 
 // Fallback provider used when no country-specific provider exists.

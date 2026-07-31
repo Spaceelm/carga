@@ -523,7 +523,13 @@ async function runAreaStatus(redis, helpers) {
   // else MGET-all records once (fallback) and cache them for write-back.
   const coords = new Map(); // id -> [lat, lon]
   const recordCache = new Map(); // id -> parsed record (only when we MGET)
-  const coordIdx = parseJson(await redis.get(keys.COORDINDEX_KEY(cc)));
+  // MUST use chunkedGet: store.js writes this index with chunkedSet, so once ES
+  // outgrows the chunk threshold a plain GET returns the {"__chunks":N} sentinel —
+  // which is a truthy object and would silently yield ZERO coords (no fallback,
+  // no error, sweep does nothing). chunkedGet returns null for a missing/broken
+  // index, which correctly falls through to the MGET-all path below.
+  const { chunkedGet } = require('../store');
+  const coordIdx = await chunkedGet(redis, keys.COORDINDEX_KEY(cc));
   if (coordIdx && typeof coordIdx === 'object') {
     for (const [id, ll] of Object.entries(coordIdx)) {
       if (Array.isArray(ll) && isFinite(ll[0]) && isFinite(ll[1])) coords.set(id, ll);

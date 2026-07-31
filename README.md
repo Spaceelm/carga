@@ -10,6 +10,7 @@ This runs on GitHub Actions. It lives in its own **public** repo because Actions
 |---|---|---|---|
 | PT | MOBI.E NAP (DATEX II v3) | `evChargingInfra` (~183 MB) | `evActualStatus` (~40 MB), joined by refill-point id |
 | ES | REVE (OCPI 2.2) + DGT | `/locations` (rate-limited, resumable crawl) | `/markers` public endpoint, tiled sweep |
+| FR | transport.data.gouv.fr (national IRVE) | BETA consolidation res. `84013` (~120 MB CSV) | consolidated `IRVE dynamique` res. `84098` (~9 MB CSV), joined by `id_pdc_itinerance` |
 
 It writes a per-country Redis keyspace (`chargers:<cc>:geo`, `charger:<cc>:<id>`, plus index/meta keys). Nothing else.
 
@@ -29,11 +30,12 @@ Set by the limits that actually bind (Actions minutes are free here):
 
 | Job | Cron (UTC) | Cadence |
 |---|---|---|
-| Full refresh (PT + ES matrix) | `0 4 * * *` | daily, after MOBI.E's ~03:00 publish |
-| PT status | `*/15 * * * *` | every 15 min |
+| Full refresh (PT + ES + FR matrix) | `13 4 * * *` | daily, after MOBI.E's ~03:00 publish |
+| PT status | `7,22,37,52 * * * *` | every ~15 min |
 | ES status sweep | `5 * * * *` | hourly |
+| FR status | `11,41 * * * *` | every 30 min |
 | ES crawl chunk | `25 */3 * * *` | every 3 h |
-| Heartbeat | `0 3 1 * *` | monthly |
+| Heartbeat | `47 3 1 * *` | monthly |
 
 Why not faster:
 
@@ -53,6 +55,8 @@ Set under *Settings → Secrets and variables → Actions*:
 | `UPSTASH_REDIS_REST_TOKEN` | all jobs | write access |
 | `REVE_API_KEY` | ES full/crawl only | official REVE OCPI API; the public `/markers` status sweep needs no key |
 
+France needs **no key at all** — the national IRVE files are Licence Ouverte 2.0 open data.
+
 Forks never receive secrets, and scheduled runs only execute on the default branch — a public repo is safe here. Never commit a `.env`.
 
 ## Running locally
@@ -67,6 +71,50 @@ UPSTASH_REDIS_REST_URL=... UPSTASH_REDIS_REST_TOKEN=... npm run ingest -- --coun
 ```bash
 npm test
 ```
+
+## France specifics
+
+France publishes by decree, so the data is genuinely open (no key, no registration)
+but **highly fragmented at the source**: ~279 separate producers publish their own
+files to data.gouv.fr, which the National Access Point deduplicates into the single
+consolidation we read. Measured on the live feeds (2026-07-31):
+
+- **164,629 charge points / 47,350 stations** — ~6x Portugal.
+- **Live status covers ~33% of connectors.** The dynamic file lists ~124k points,
+  but only ~57k rows are fresher than 24h; the rest are unmaintained producers,
+  some last updated in 2020. Stale rows are dropped, so those points read
+  `unknown` (grey) rather than falsely "available" — the same only-confirmed-counts
+  policy used for Spain.
+- **Richer static schema than PT/ES**: payment methods (`paiement_cb`), free-charging
+  flag, opening hours, reservation, PMR accessibility, vehicle-size restrictions and
+  free-text tariffs. We currently map hours, payment/reservation capabilities,
+  parking type and the free-charging flag; `tarification` is free text (only ~22%
+  populated, no consistent grammar) and is deliberately **not** parsed into prices.
+- **Two known feed defects**, both handled in `providers/fr.js`: ~900 rows publish
+  **watts** in the kW column (values > 1000 are divided by 1000), and
+  `cable_t2_attache` is 100% empty in the consolidation (so AC connectors report an
+  `unknown` format rather than guessing socket-vs-tethered).
+
+### Why FR needs chunked indexes
+
+`store.js` writes a point index (charge point → station) at every full refresh. PT's
+fits in one value; FR's ~165k entries serialize past **Upstash's ~1 MB request cap**,
+which would fail the write outright. `chunkedSet`/`chunkedGet` split oversized values
+across `<key>:c<n>` keys behind a `{"__chunks":N}` sentinel. Values under the
+threshold are still written as a single plain SET, so PT and ES are byte-for-byte
+unchanged and no migration was needed. A partially-written or partially-missing chunk
+set reads back as `null`, which callers already treat as "index absent" and fall back
+to the always-correct full path.
+
+### FR budget note
+
+FR runs status every 30 min (not 15) and rolls availability history every **3 hours**
+(`provider.historyEveryHours = 3`) instead of hourly. The history roll is the
+expensive part — it MGETs every station — and 47k stations hourly would dominate the
+500k/month Upstash budget on its own. `accumulateHistory` spreads each observation
+across the three hourly buckets the window covers, so the 7x24 profile has no gaps,
+just 3-hour resolution. Between rolls the cheap delta path touches only the charge
+points whose status actually changed.
 
 ## Shared file: `netlify/functions/_reve.js`
 

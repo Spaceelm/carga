@@ -21,7 +21,7 @@
  */
 
 const { getProvider } = require('./providers');
-const { writeChargers, makeRedis, keys } = require('./store');
+const { writeChargers, makeRedis, keys, chunkedGet, chunkedSet } = require('./store');
 const { CHARGER_STATUS } = require('./schema');
 
 // Availability history: 7 days x 24 hours = 168 UTC buckets, one byte each
@@ -33,11 +33,23 @@ const HISTORY_ALPHA = 0.25; // weight of the newest observation
  * EWMA-accumulate the current fraction-available into this weekday+hour bucket.
  * Seeds a brand-new profile with the first observation so the slider isn't biased
  * to 0 while data builds. Mutates charger.history (base64). Returns true if written.
+ *
+ * `spreadHours` (default 1) writes the observation into this bucket AND the
+ * preceding N-1 hourly buckets. Providers that roll history every N hours (FR:
+ * historyEveryHours=3, because MGET-ing 47k stations hourly would blow the Upstash
+ * budget) use it so every bucket still receives data — the profile simply has
+ * N-hour resolution instead of gaps frozen at their seed value.
+ *
+ * A charger whose every connector is status "unknown" is skipped entirely: the
+ * feed carries no observation for it, and seeding/rolling a fake 0%-available
+ * profile would wrongly trip the Min Availability filter (common for FR, where
+ * only operators publishing dynamic data are covered).
  */
-function accumulateHistory(charger, now) {
+function accumulateHistory(charger, now, spreadHours = 1) {
   const conns = charger.connectors || [];
   const total = conns.length;
   if (total === 0) return false;
+  if (conns.every((c) => c.status === CHARGER_STATUS.UNKNOWN)) return false;
   const available = conns.filter((c) => c.status === CHARGER_STATUS.AVAILABLE).length;
   const frac = available / total;
   const seed = Math.round(frac * 255);
@@ -49,10 +61,14 @@ function accumulateHistory(charger, now) {
   } else {
     hist = new Uint8Array(HISTORY_BUCKETS).fill(seed);
   }
-  const bucket = now.getUTCDay() * 24 + now.getUTCHours(); // 0..167
-  const prev = hist[bucket] / 255;
-  const next = prev * (1 - HISTORY_ALPHA) + frac * HISTORY_ALPHA;
-  hist[bucket] = Math.max(0, Math.min(255, Math.round(next * 255)));
+  const nowBucket = now.getUTCDay() * 24 + now.getUTCHours(); // 0..167
+  const n = Math.max(1, Math.min(24, spreadHours | 0));
+  for (let k = 0; k < n; k++) {
+    const bucket = (nowBucket - k + HISTORY_BUCKETS) % HISTORY_BUCKETS;
+    const prev = hist[bucket] / 255;
+    const next = prev * (1 - HISTORY_ALPHA) + frac * HISTORY_ALPHA;
+    hist[bucket] = Math.max(0, Math.min(255, Math.round(next * 255)));
+  }
   charger.history = Buffer.from(hist).toString('base64');
   return true;
 }
@@ -217,23 +233,39 @@ async function runStatusOnly(provider, args, redisClient) {
     return o;
   };
 
-  // History is bucketed per UTC weekday+hour, so accumulate at most once per hour —
-  // the frequent (e.g. 15-min) runs only patch status. `lastHistoryHour` in meta
-  // gates it; whichever run first enters a new hour rolls history for everyone.
-  const hourStamp = nowTs.toISOString().slice(0, 13); // "YYYY-MM-DDTHH"
+  // History is bucketed per UTC weekday+hour, so accumulate at most once per
+  // history window — the frequent runs only patch status. `lastHistoryHour` in meta
+  // gates it; whichever run first enters a new window rolls history for everyone.
+  // Providers may widen the window (provider.historyEveryHours, e.g. FR=3): the
+  // roll then happens once per N hours and spreads the observation over the N
+  // hourly buckets it covers (see accumulateHistory), trading time resolution for
+  // an N-fold cut in the expensive MGET-all sweeps.
+  const histEvery = Math.max(1, Math.min(24, (provider.historyEveryHours | 0) || 1));
+  const gatedHour = Math.floor(nowTs.getUTCHours() / histEvery) * histEvery;
+  const hourStamp = `${nowTs.toISOString().slice(0, 11)}${String(gatedHour).padStart(2, '0')}`; // "YYYY-MM-DDTHH" (window-floored)
   const meta = parseJson(await redis.get(keys.META_KEY(cc)));
   const accumulate = !meta || meta.lastHistoryHour !== hourStamp;
 
   // ---- Fast delta path (no history this run): only touch records whose status
   // changed since the previous run. Needs the stable pointindex + the last-feed
-  // snapshot; if either is missing we fall through to the full path (always correct). ----
+  // snapshot; if either is missing we fall through to the full path (always correct).
+  // Both indexes may be chunked across keys (FR-sized feeds exceed Upstash's ~1 MB
+  // request cap); chunkedGet returns null on any inconsistency -> full path. ----
   if (!accumulate) {
-    const pointIndex = parseJson(await redis.get(keys.POINTINDEX_KEY(cc)));
-    const lastFeed = parseJson(await redis.get(keys.LASTFEED_KEY(cc)));
+    const pointIndex = await chunkedGet(redis, keys.POINTINDEX_KEY(cc));
+    const lastFeed = await chunkedGet(redis, keys.LASTFEED_KEY(cc));
     if (pointIndex && lastFeed) {
       const changedIds = new Set();
       for (const [pointId, chargerId] of Object.entries(pointIndex)) {
-        if (lastFeed[pointId] !== statusOf(pointId)) changedIds.add(chargerId);
+        // Normalize BOTH sides to a status string before comparing. The point index
+        // covers every point in the STATIC feed, but the snapshot only holds points
+        // the status feed actually carried, so an uncovered point reads `undefined`
+        // here while statusOf() reports "unknown". Comparing those directly marked
+        // every uncovered point as changed on every run — for FR, where ~65% of
+        // points have no dynamic row, that turned the delta path into a near-full
+        // sweep forever. (Invisible for PT: MOBI.E covers essentially every point.)
+        const prev = lastFeed[pointId] || CHARGER_STATUS.UNKNOWN;
+        if (prev !== statusOf(pointId)) changedIds.add(chargerId);
       }
       const changed = [...changedIds];
       let patched = 0;
@@ -265,7 +297,7 @@ async function runStatusOnly(provider, args, redisClient) {
         }
         if (Object.keys(updates).length > 0) await redis.mset(updates);
       }
-      await redis.set(keys.LASTFEED_KEY(cc), JSON.stringify(feedSnapshot()));
+      await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
       await redis.set(keys.META_KEY(cc), JSON.stringify({
         lastRun: nowTs.toISOString(),
         count: ids.length,
@@ -302,7 +334,8 @@ async function runStatusOnly(provider, args, redisClient) {
       if (charger.status !== agg) { charger.status = agg; changed = true; }
 
       // Roll the availability observation into the hourly history profile (gated).
-      const histChanged = accumulate ? accumulateHistory(charger, nowTs) : false;
+      // Spread over the provider's whole history window so no bucket starves.
+      const histChanged = accumulate ? accumulateHistory(charger, nowTs, histEvery) : false;
 
       if (changed) { charger.lastUpdated = new Date().toISOString(); patched++; }
       if (changed || histChanged) {
@@ -312,7 +345,7 @@ async function runStatusOnly(provider, args, redisClient) {
     if (Object.keys(updates).length > 0) await redis.mset(updates);
   }
 
-  await redis.set(keys.LASTFEED_KEY(cc), JSON.stringify(feedSnapshot()));
+  await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
   await redis.set(keys.META_KEY(cc), JSON.stringify({
     lastRun: nowTs.toISOString(),
     count: ids.length,

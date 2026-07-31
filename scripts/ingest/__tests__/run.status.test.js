@@ -12,8 +12,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { runStatusOnly } = require('../run');
-const { keys } = require('../store');
+const { runStatusOnly, accumulateHistory } = require('../run');
+const { keys, chunkedSet, chunkedGet } = require('../store');
 const { CHARGER_STATUS } = require('../schema');
 
 const CC = 'pt';
@@ -125,6 +125,95 @@ test('transition to a non-charging status does not stamp lastBusyAt', async () =
   const b = JSON.parse(redis._store.get(keys.CHARGER_KEY(CC, 'B')));
   assert.strictEqual(b.connectors[0].status, CHARGER_STATUS.OUT_OF_ORDER, 'status changed');
   assert.ok(!b.connectors[0].lastBusyAt, 'no session-start stamp for a non-charging transition');
+});
+
+// ---------------------------------------------------------------------------
+// Chunked index values (FR's point index exceeds Upstash's ~1 MB request cap)
+// ---------------------------------------------------------------------------
+test('chunkedSet/chunkedGet: small values stay plain (PT/ES unchanged)', async () => {
+  const redis = makeFakeRedis({});
+  const obj = { a: 'A', b: 'B' };
+  const cmds = await chunkedSet(redis, 'k', obj);
+  assert.strictEqual(cmds, 1, 'one SET, no chunking');
+  assert.strictEqual(redis._store.get('k'), JSON.stringify(obj), 'stored verbatim as before');
+  assert.ok(!redis._store.has('k:c0'), 'no chunk keys created');
+  assert.deepStrictEqual(await chunkedGet(redis, 'k'), obj);
+});
+
+test('chunkedGet reads a legacy plain value written by a bare SET', async () => {
+  const redis = makeFakeRedis({ k: JSON.stringify({ p1: 'A' }) });
+  assert.deepStrictEqual(await chunkedGet(redis, 'k'), { p1: 'A' });
+});
+
+test('chunkedSet/chunkedGet: large values round-trip via chunks', async () => {
+  const redis = makeFakeRedis({});
+  process.env.INGEST_CHUNK_CHARS = '';
+  // Build an index far larger than the chunk threshold used in production.
+  const big = {};
+  for (let i = 0; i < 60000; i++) big[`FRPDCE${i}`] = `FRSTATION${i % 9000}`;
+  const json = JSON.stringify(big);
+  assert.ok(json.length > 700000, `fixture must exceed the threshold (was ${json.length})`);
+  const cmds = await chunkedSet(redis, 'idx', big);
+  assert.ok(cmds > 1, 'chunked into multiple SETs');
+  const sentinel = JSON.parse(redis._store.get('idx'));
+  assert.ok(Number.isInteger(sentinel.__chunks) && sentinel.__chunks === cmds - 1);
+  assert.deepStrictEqual(await chunkedGet(redis, 'idx'), big, 'exact round-trip');
+});
+
+test('chunkedGet returns null when a chunk is missing (caller falls back)', async () => {
+  const redis = makeFakeRedis({});
+  const big = {};
+  for (let i = 0; i < 60000; i++) big[`FRPDCE${i}`] = `S${i}`;
+  await chunkedSet(redis, 'idx', big);
+  redis._store.delete('idx:c1');
+  assert.strictEqual(await chunkedGet(redis, 'idx'), null, 'incomplete set is not partially trusted');
+});
+
+test('chunkedGet survives a client that pre-deserializes chunk strings', async () => {
+  // The Upstash client may JSON-parse values on read; chunks are JSON-encoded
+  // strings, so both the raw and the already-unwrapped form must work.
+  const redis = makeFakeRedis({});
+  const big = {};
+  for (let i = 0; i < 60000; i++) big[`FRPDCE${i}`] = `S${i}`;
+  await chunkedSet(redis, 'idx', big);
+  const n = JSON.parse(redis._store.get('idx')).__chunks;
+  for (let k = 0; k < n; k++) {
+    const key = `idx:c${k}`;
+    redis._store.set(key, JSON.parse(redis._store.get(key))); // simulate auto-deserialization
+  }
+  assert.deepStrictEqual(await chunkedGet(redis, 'idx'), big);
+});
+
+// ---------------------------------------------------------------------------
+// History accumulation guards
+// ---------------------------------------------------------------------------
+test('accumulateHistory skips a charger whose every connector is unknown', () => {
+  const c = { connectors: [{ status: CHARGER_STATUS.UNKNOWN }, { status: CHARGER_STATUS.UNKNOWN }] };
+  assert.strictEqual(accumulateHistory(c, new Date()), false, 'no observation -> no write');
+  assert.strictEqual(c.history, undefined, 'must not seed a fake 0%-available profile');
+});
+
+test('accumulateHistory records a partial observation when some plugs are known', () => {
+  const c = { connectors: [{ status: CHARGER_STATUS.AVAILABLE }, { status: CHARGER_STATUS.UNKNOWN }] };
+  assert.strictEqual(accumulateHistory(c, new Date()), true);
+  assert.strictEqual(Buffer.from(c.history, 'base64').length, 168);
+});
+
+test('accumulateHistory spreadHours fills the whole window, not just one bucket', () => {
+  const at = new Date(Date.UTC(2026, 6, 31, 10, 0, 0)); // Friday 10:00Z
+  const c = { connectors: [{ status: CHARGER_STATUS.AVAILABLE }] };
+  assert.strictEqual(accumulateHistory(c, at, 3), true);
+  const h = Buffer.from(c.history, 'base64');
+  const base = at.getUTCDay() * 24;
+  for (const hour of [10, 9, 8]) {
+    assert.ok(h[base + hour] > 0, `bucket for ${hour}:00 written`);
+  }
+  // A fresh profile is seeded everywhere, so compare against a 1-hour spread
+  // to prove the neighbouring buckets got a second, independent observation.
+  const c1 = { connectors: [{ status: CHARGER_STATUS.AVAILABLE }] };
+  accumulateHistory(c1, at, 1);
+  const h1 = Buffer.from(c1.history, 'base64');
+  assert.ok(h[base + 9] >= h1[base + 9], 'spread window rolls the earlier bucket too');
 });
 
 test('missing lastfeed falls back to the full path (still correct)', async () => {
