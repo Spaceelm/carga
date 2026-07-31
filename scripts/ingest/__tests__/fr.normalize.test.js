@@ -284,6 +284,26 @@ test('station open24h is true if ANY of its points is 24/7', async () => {
   assert.equal(c.open24h, true);
 });
 
+test('every FR evseId starts with FR, even without an itinerance id', async () => {
+  // The client derives a charger's country from this id prefix to scope community
+  // tariffs; an id that does not identify its country falls through to being priced
+  // with ANOTHER country's tariffs. id_pdc_local is arbitrary producer text, so it
+  // must never be used bare.
+  const csv = staticCsv(
+    row({ id_pdc_itinerance: 'FRABCE0001', id_pdc_local: 'BORNE-7' }),
+    row({ id_pdc_itinerance: 'Non concerné', id_pdc_local: 'BORNE-8' }),
+    row({ id_station_itinerance: 'Non concerné', id_pdc_itinerance: '', id_pdc_local: '42',
+          consolidated_latitude: '45.75', consolidated_longitude: '4.85' }),
+  );
+  const out = await fr.normalize(csv, null);
+  const ids = out.flatMap((c) => c.connectors.map((k) => k.evseId));
+  assert.ok(ids.length >= 3, `expected all points to survive, got ${ids.length}`);
+  for (const id of ids) {
+    assert.match(id, /^FR/, `evseId "${id}" must be FR-prefixed`);
+  }
+  for (const c of out) assert.match(c.id, /^FR/, `station id "${c.id}" must be FR-prefixed`);
+});
+
 test('provider declares a 3-hour history window and a status feed', () => {
   assert.equal(fr.hasStatusFeed, true);
   assert.equal(fr.historyEveryHours, 3);

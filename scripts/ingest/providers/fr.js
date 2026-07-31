@@ -397,7 +397,13 @@ async function normalizeStreaming(staticInput, statusInput, onCharger) {
       voltage: null,
       amperage: null,
       pointId: pdcId,
-      evseId: pdcId || String(r.id_pdc_local || '').trim() || `${stationId}-${++synth}`,
+      // Always starts with "FR": the client derives a charger's country from this
+      // id prefix to scope community tariffs, and an id that doesn't identify its
+      // country falls through to being priced with another country's tariffs. The
+      // raw id_pdc_local is deliberately NOT used bare — producers set it to
+      // arbitrary local strings. stationId is itself always FR-prefixed (real
+      // AFIREV id or the FRX… synthetic), so deriving from it preserves the rule.
+      evseId: pdcId || `${stationId}-${++synth}`,
       status: live ? live.status : CHARGER_STATUS.UNKNOWN,
       // Only a real live observation sets this. Falling back to the producer's
       // date_maj (measured as far back as 2020) would mix years-old dates with
