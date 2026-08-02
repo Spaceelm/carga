@@ -269,6 +269,164 @@ const FREE_TARIFF = Object.freeze([{
 }]);
 
 // ---------------------------------------------------------------------------
+// `tarification` — free text, but ~21% of rows are filled and a real grammar
+// hides inside. Two shapes dominate:
+//   machine-generated: "entre 08:00 et 20:00 : 0.39€ par kwh de charge,
+//                       3.2€ par heure d'occupation hors charge, …"
+//   hand-written:      "0,29€ / kWh"  ·  "AC 36cts/KWh"  ·  "0.27€/kWh+0.10€/min"
+// The rest is prose, URLs, "Inconnu", "-" — those yield nothing and are skipped.
+//
+// The distinction that matters is WHICH kind of time fee is attached, because a
+// per-hour idle penalty does not change what a charge costs while a per-minute
+// charging fee does:
+//   "…par heure d'occupation…" -> OCPI PARKING_TIME (client ignores it; €/kWh stands)
+//   any other €/h or €/min     -> OCPI TIME (client then refuses to show a price,
+//                                 which is correct: €/kWh alone would understate)
+// Unqualified time fees are treated as TIME on purpose — when the text is
+// ambiguous, showing no price beats showing a misleadingly low one.
+// ---------------------------------------------------------------------------
+// A number that is not itself part of a longer number. The surrounding words decide
+// whether a rate is the AC one or the DC one, and whether an hourly fee is an idle
+// penalty or part of the charge — but that context is read from the string by INDEX
+// after matching, never captured in the pattern: a leading `.{0,28}` group is greedy
+// and silently swallows leading digits ("36cts" matching as 6, "0,29€" as 9).
+const NUM = '(?<![\\d.,])(\\d+(?:[.,]\\d+)?)';
+const RE_KWH = new RegExp(NUM + '\\s*(€|eur|cts?|centimes?)\\s*(?:/|par\\s+)\\s*kwh', 'gi');
+const RE_PER_TIME = new RegExp(NUM + '\\s*(?:€|eur)\\s*(?:/|par\\s+)\\s*(min|h\\b|heure)', 'gi');
+const RE_SESSION = new RegExp(NUM + '\\s*(?:€|eur)\\s*(?:à\\s+la\\s+connexion|de\\s+connexion|par\\s+(?:session|recharge)|fixe|\\+)', 'gi');
+// How much text around a match is inspected to classify it.
+const CTX_BEFORE = 30;
+const CTX_AFTER = 36;
+
+// Sanity band for a European €/kWh. Rejects unit mix-ups and stray numbers that
+// merely sit next to "kWh" (e.g. a "50 kWh" battery-capacity mention).
+const MIN_EUR_KWH = 0.05;
+const MAX_EUR_KWH = 2.0;
+
+const num = (s) => parseFloat(String(s).replace(',', '.'));
+
+// Which plug kind a fragment is talking about. HPC/ultra/rapide all mean DC in
+// French operator copy; "lente"/"accélérée" mean AC.
+function kindFromContext(ctx) {
+  const s = String(ctx || '').toLowerCase();
+  if (/\b(dc|hpc|ultra|rapide|combo|ccs|chademo)\b/.test(s)) return 'dc';
+  if (/\b(ac|lente?|accel|accél|t2|type\s*2)\b/.test(s)) return 'ac';
+  return null;
+}
+
+/**
+ * Parse `tarification` into structured rates, preserving the published text.
+ *
+ * Returns null only when the text is empty. Otherwise always returns
+ * `{ raw, rates }`, where `rates` may be empty — an empty list still matters,
+ * because the raw text is surfaced to the user as the only pricing information
+ * we have for that charger.
+ *
+ * Each rate is `{ kind, energy, perMinute, sessionFee, idlePerHour }`:
+ *   kind        'ac' | 'dc' | null (null = applies to any plug)
+ *   energy      €/kWh
+ *   perMinute   €/min charged DURING the session (an OCPI TIME component)
+ *   sessionFee  one-off connection fee (OCPI FLAT)
+ *   idlePerHour €/h for overstaying AFTER charging (OCPI PARKING_TIME) — a
+ *               penalty, deliberately excluded from the cost of a normal charge
+ *
+ * Nothing is min()'d away here: the AC and DC rates stay separate so each plug can
+ * be priced with its own, and the time components are kept so the client can
+ * amortize them over its reference session instead of discarding the price.
+ */
+function parseTariff(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+
+  /** @type {Map<string, any>} kind -> rate */
+  const byKind = new Map();
+  const rateFor = (kind) => {
+    const key = kind || '*';
+    if (!byKind.has(key)) byKind.set(key, { kind: kind || null, energy: null, perMinute: null, sessionFee: null, idlePerHour: null });
+    return byKind.get(key);
+  };
+
+  const before = (i) => raw.slice(Math.max(0, i - CTX_BEFORE), i);
+  const after = (i) => raw.slice(i, i + CTX_AFTER);
+
+  let m;
+  RE_KWH.lastIndex = 0;
+  while ((m = RE_KWH.exec(raw)) !== null) {
+    const unit = m[2].toLowerCase();
+    let v = num(m[1]);
+    if (unit.startsWith('c')) v /= 100; // centimes
+    if (!isFinite(v) || v < MIN_EUR_KWH || v > MAX_EUR_KWH) continue;
+    const r = rateFor(kindFromContext(before(m.index)));
+    // Several windows quoted for one plug kind (time-of-day pricing): keep the
+    // lowest, which is the "from €X" the rest of the app already shows.
+    if (r.energy == null || v < r.energy) r.energy = v;
+  }
+
+  RE_PER_TIME.lastIndex = 0;
+  while ((m = RE_PER_TIME.exec(raw)) !== null) {
+    const v = num(m[1]);
+    if (!isFinite(v) || v <= 0) continue;
+    const perMinuteUnit = /^min/i.test(m[2]);
+    const perMin = perMinuteUnit ? v : v / 60;
+    // "occupation hors charge" and friends are penalties for overstaying AFTER the
+    // charge, so they must not inflate the cost of a normal session.
+    const idle = /occupation|stationnement|au-del|apr[eè]s|surstationnement/i
+      .test(after(m.index + m[0].length));
+    const r = rateFor(kindFromContext(before(m.index)));
+    if (idle) {
+      const perHour = perMinuteUnit ? v * 60 : v;
+      if (r.idlePerHour == null || perHour < r.idlePerHour) r.idlePerHour = perHour;
+    } else if (r.perMinute == null || perMin < r.perMinute) {
+      r.perMinute = perMin;
+    }
+  }
+
+  RE_SESSION.lastIndex = 0;
+  while ((m = RE_SESSION.exec(raw)) !== null) {
+    const v = num(m[1]);
+    if (!isFinite(v) || v <= 0 || v > 20) continue;
+    const r = rateFor(null);
+    if (r.sessionFee == null || v < r.sessionFee) r.sessionFee = v;
+  }
+
+  // A fee stated without its own €/kWh belongs to the generic rate; drop kind
+  // buckets that ended up carrying nothing at all.
+  const rates = [...byKind.values()].filter(
+    (r) => r.energy != null || r.perMinute != null || r.sessionFee != null || r.idlePerHour != null,
+  );
+  return { raw, rates };
+}
+
+/**
+ * The rate that applies to one plug: its own kind's, else the generic one, merged
+ * so a generic session fee still applies to a kind-specific energy rate.
+ */
+function rateForConnector(parsed, isDc) {
+  if (!parsed || !parsed.rates.length) return null;
+  const want = isDc ? 'dc' : 'ac';
+  const specific = parsed.rates.find((r) => r.kind === want) || null;
+  const generic = parsed.rates.find((r) => r.kind === null) || null;
+  if (!specific) return generic;
+  return {
+    kind: specific.kind,
+    energy: specific.energy != null ? specific.energy : (generic && generic.energy),
+    perMinute: specific.perMinute != null ? specific.perMinute : (generic && generic.perMinute),
+    sessionFee: specific.sessionFee != null ? specific.sessionFee : (generic && generic.sessionFee),
+    idlePerHour: specific.idlePerHour != null ? specific.idlePerHour : (generic && generic.idlePerHour),
+  };
+}
+
+/** Structured rate -> OCPI AD_HOC_PAYMENT tariff, or null when it prices nothing. */
+function rateToTariff(rate) {
+  if (!rate || rate.energy == null) return null;
+  const pc = [{ type: 'ENERGY', price: Math.round(rate.energy * 10000) / 10000, vat: null, step_size: 1 }];
+  if (rate.perMinute) pc.push({ type: 'TIME', price: Math.round(rate.perMinute * 10000) / 10000, vat: null, step_size: 60 });
+  if (rate.sessionFee) pc.push({ type: 'FLAT', price: rate.sessionFee, vat: null, step_size: 1 });
+  if (rate.idlePerHour) pc.push({ type: 'PARKING_TIME', price: rate.idlePerHour, vat: null, step_size: 60 });
+  return [{ type: 'AD_HOC_PAYMENT', currency: 'EUR', elements: [{ price_components: pc }] }];
+}
+
+// ---------------------------------------------------------------------------
 // Status feed
 // ---------------------------------------------------------------------------
 /**
@@ -389,6 +547,13 @@ async function normalizeStreaming(staticInput, statusInput, onCharger) {
 
     const live = pdcId ? statusById.get(pdcId) : null;
     const standard = mapStandard(r);
+    const isDc = standard === CONNECTOR_STANDARD.CCS || standard === CONNECTOR_STANDARD.CHADEMO;
+    // Price this plug with its OWN kind's rate, so narrowing the map to AC or DC
+    // shows the rate that actually applies instead of the site's cheapest.
+    const parsedTariff = truthy(r.gratuit) ? null : parseTariff(r.tarification);
+    const tariffs = truthy(r.gratuit)
+      ? FREE_TARIFF
+      : rateToTariff(rateForConnector(parsedTariff, isDc));
     st.connectors.push({
       standard,
       format: mapFormat(r, standard),
@@ -411,7 +576,12 @@ async function normalizeStreaming(staticInput, statusInput, onCharger) {
       // to UNAVAILABLE when it looks >2 weeks staler than its siblings — which
       // would grey out working French chargers. No observation => no timestamp.
       lastUpdated: live ? live.lastUpdated : null,
-      ...(truthy(r.gratuit) ? { tariffs: FREE_TARIFF } : {}),
+      // gratuit wins: an explicit "free" flag beats whatever the prose says.
+      ...(tariffs ? { tariffs } : {}),
+      // The operator's published wording, verbatim, whenever there is any. Kept even
+      // when nothing parsed — for a charger with no computable price this text is the
+      // only pricing information that exists, and the UI shows it rather than nothing.
+      ...(parsedTariff && parsedTariff.raw ? { tariffNote: parsedTariff.raw } : {}),
     });
   }));
 
@@ -470,6 +640,9 @@ module.exports = {
   _mapDynStatus: mapDynStatus,
   _parseHorodatage: parseHorodatage,
   _mapCapabilities: mapCapabilities,
+  _parseTariff: parseTariff,
+  _rateForConnector: rateForConnector,
+  _rateToTariff: rateToTariff,
   _mapStandard: mapStandard,
   _mapFormat: mapFormat,
   _parseCoords: parseCoords,

@@ -304,6 +304,81 @@ test('every FR evseId starts with FR, even without an itinerance id', async () =
   for (const c of out) assert.match(c.id, /^FR/, `station id "${c.id}" must be FR-prefixed`);
 });
 
+test('parseTariff keeps the AC and DC rates separate', () => {
+  // The point of parsing per kind: narrowing the map to DC must price the DC plug
+  // with the DC rate, not the site's cheapest.
+  const p = fr._parseTariff('AC 0.36€/kWh - DC 0.59€/kWh');
+  assert.equal(fr._rateForConnector(p, false).energy, 0.36);
+  assert.equal(fr._rateForConnector(p, true).energy, 0.59);
+  // HPC is French operator copy for high-power DC.
+  const hpc = fr._parseTariff('HPC 49cts/Kwh');
+  assert.equal(fr._rateForConnector(hpc, true).energy, 0.49);
+  assert.equal(fr._rateForConnector(hpc, false), null, 'no AC rate quoted -> none');
+});
+
+test('parseTariff reads the common hand-written and centime forms', () => {
+  const e = (s, dc) => {
+    const r = fr._rateForConnector(fr._parseTariff(s), !!dc);
+    return r ? r.energy : null;
+  };
+  assert.equal(e('0,29€ / kWh'), 0.29);      // decimal comma
+  assert.equal(e('AC 36cts/KWh'), 0.36);     // centimes, must not parse as 6
+  assert.equal(e('59 cts/kWh'), 0.59);
+});
+
+test('parseTariff keeps time and session fees instead of discarding the price', () => {
+  // These are amortized by the client over its reference session, so they must
+  // survive parsing rather than causing the price to be suppressed.
+  const perMin = fr._rateForConnector(fr._parseTariff('0.27€/kWh+0.10€/min pour les non abonnées'), false);
+  assert.equal(perMin.energy, 0.27);
+  assert.equal(perMin.perMinute, 0.1);
+
+  const sess = fr._rateForConnector(fr._parseTariff('Bornes rapides: 2€ + 0.59€ / kWh'), true);
+  assert.equal(sess.energy, 0.59);
+  assert.equal(sess.sessionFee, 2, 'connection fee must not be read as the energy rate');
+});
+
+test('parseTariff treats an overstay penalty as idle, not as charging cost', () => {
+  const r = fr._rateForConnector(
+    fr._parseTariff("entre 08:00 et 20:00 : 0.39€ par kwh de charge, 3.2€ par heure d'occupation hors charge"),
+    false,
+  );
+  assert.equal(r.energy, 0.39);
+  assert.equal(r.idlePerHour, 3.2);
+  assert.equal(r.perMinute, null, 'an occupation fee must not inflate the cost of charging');
+});
+
+test('parseTariff always preserves the published wording', () => {
+  // Even when nothing computable comes out, the text is the only pricing
+  // information the charger has and is surfaced to the user.
+  for (const s of ['Inconnu', 'https://x.fr/tarifs', 'Grille tarifaire en ligne', 'Payant']) {
+    const p = fr._parseTariff(s);
+    assert.equal(p.raw, s);
+    assert.equal(p.rates.length, 0, `expected no rates for ${JSON.stringify(s)}`);
+    assert.equal(fr._rateToTariff(fr._rateForConnector(p, false)), null);
+  }
+  assert.equal(fr._parseTariff(''), null);
+  assert.equal(fr._parseTariff(null), null);
+});
+
+test('parseTariff rejects implausible rates and stray kWh mentions', () => {
+  const e = (s) => { const r = fr._rateForConnector(fr._parseTariff(s), false); return r ? r.energy : null; };
+  assert.equal(e('Recharge de 50 kWh disponible'), null);
+  assert.equal(e('3500€/kWh'), null);
+});
+
+test('the connector carries the published wording verbatim', async () => {
+  const txt = 'Tarification au kWh plus frais de connexion selon abonnement';
+  const [c] = await fr.normalize(staticCsv(row({ tarification: txt })), null);
+  assert.equal(c.connectors[0].tariffNote, txt);
+  assert.equal(c.connectors[0].tariffs, undefined, 'nothing computable -> no tariff');
+});
+
+test('gratuit overrides the tarification prose', async () => {
+  const [c] = await fr.normalize(staticCsv(row({ gratuit: 'true', tarification: '0,45€ / kWh' })), null);
+  assert.equal(c.connectors[0].tariffs[0].elements[0].price_components[0].price, 0);
+});
+
 test('provider declares a 3-hour history window and a status feed', () => {
   assert.equal(fr.hasStatusFeed, true);
   assert.equal(fr.historyEveryHours, 3);
