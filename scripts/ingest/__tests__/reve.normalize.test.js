@@ -176,3 +176,32 @@ test('normalizeStreaming accepts {locations, tariffsById} and a bare array', asy
   await reve.normalizeStreaming([loc()], null, (c) => out2.push(c));
   assert.strictEqual(out2[0].connectors[0].tariffs, undefined);
 });
+
+test('the resumable crawl path threads tariffs and operational status through', async () => {
+  // ES is the ONLY provider that uses the crawl, and the crawl used to hand
+  // normalizeStreaming just { locations }. Both enrichment passes were therefore
+  // unreachable in production and every Spanish connector shipped `tariffs: []`.
+  const loc = {
+    id: 'L1', name: 'Sample', coordinates: { latitude: '40.4', longitude: '-3.7' },
+    operator: { name: 'Op' },
+    evses: [{ uid: 'E1', evse_id: 'ES*AAA*E1', connectors: [{ id: '1', standard: 'IEC_62196_T2', max_electric_power: 22000 }] }],
+  };
+  const tariffsById = new Map([['1', [{
+    type: 'AD_HOC_PAYMENT', currency: 'EUR',
+    elements: [{ price_components: [{ type: 'ENERGY', price: 0.45, vat: 21, step_size: 1 }] }],
+  }]]]);
+
+  const bare = [];
+  await reve.normalizeStreaming({ locations: [loc] }, null, (c) => bare.push(c));
+  assert.equal(bare[0].connectors[0].tariffs, undefined, 'locations alone carry no price');
+
+  const rich = [];
+  await reve.normalizeStreaming({ locations: [loc], tariffsById }, null, (c) => rich.push(c));
+  const pc = rich[0].connectors[0].tariffs[0].elements[0].price_components[0];
+  assert.equal(pc.type, 'ENERGY');
+  assert.equal(pc.price, 0.45);
+});
+
+test('reve exposes fetchEnrichment so the crawl can complete the record', () => {
+  assert.equal(typeof reve.fetchEnrichment, 'function');
+});

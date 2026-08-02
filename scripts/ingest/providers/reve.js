@@ -309,10 +309,30 @@ async function fetch(opts = {}) {
   if (opts.statusOnly) return { staticStream: null, statusStream: null };
   const nodeFetch = require('node-fetch');
   const locations = await getAllPages(nodeFetch, '/locations');
-  // Graceful secondary passes; empty Maps if they can't be fetched (rate limits).
+  const { tariffsById, operationalById } = await fetchEnrichment();
+  return { staticStream: { locations, tariffsById, operationalById }, statusStream: null };
+}
+
+/**
+ * The two secondary passes that enrich a location set: dynamic pricing
+ * (/connectors/tariffs) and operational status (/evses/operational_status).
+ *
+ * Split out of fetch() because ES does NOT go through fetch(): /locations is
+ * rate-limited well below one-run coverage, so ES is ingested by the resumable
+ * crawl instead, which only ever collected locations. That left both of these
+ * unreachable for the one country that uses them — every ES connector shipped
+ * with `tariffs: []`. run.js now calls this once the crawl completes, i.e. once
+ * per crawl cycle rather than on every chunk, which keeps it inside the API's
+ * ~5 req/hr budget.
+ *
+ * Graceful by construction: either pass failing yields an empty Map, so a
+ * rate-limited run still writes locations rather than losing the whole cycle.
+ */
+async function fetchEnrichment() {
+  const nodeFetch = require('node-fetch');
   const tariffsById = await fetchTariffs(nodeFetch);
   const operationalById = await fetchOperationalStatus(nodeFetch);
-  return { staticStream: { locations, tariffsById, operationalById }, statusStream: null };
+  return { tariffsById, operationalById };
 }
 
 /**
@@ -651,6 +671,7 @@ module.exports = {
   // run.js drives this instead of fetch() when present. See crawlStatic.
   crawlStatic,
   clearCrawlState,
+  fetchEnrichment,
   normalize,
   normalizeStreaming,
   parseStatus,

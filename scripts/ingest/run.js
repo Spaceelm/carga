@@ -128,8 +128,31 @@ async function runResumableFull(provider, args) {
     return { upserted: 0, skipped: 0, swept: 0, dryRun: !!args.dryRun, crawl: crawl.dryRun ? 'dry-run' : 'partial', nextPage: crawl.nextPage };
   }
 
+  // The crawl only ever collects locations. Anything that enriches them — REVE's
+  // published tariffs and operational status — has to be fetched here, or it never
+  // reaches the record: the crawl is the ONLY path ES takes, so passing just
+  // { locations } silently shipped every Spanish connector with `tariffs: []`.
+  // Fetched at completion, so it costs one extra pass per crawl cycle (~10 days),
+  // not one per chunk, which keeps it inside REVE's ~5 req/hr budget.
+  let enrichment = {};
+  if (typeof provider.fetchEnrichment === 'function') {
+    try {
+      enrichment = await provider.fetchEnrichment();
+      const nT = enrichment.tariffsById ? enrichment.tariffsById.size : 0;
+      const nO = enrichment.operationalById ? enrichment.operationalById.size : 0;
+      log(`enrichment: ${nT} tariff record(s), ${nO} operational status(es)`);
+    } catch (e) {
+      // Never lose a completed crawl over a secondary pass.
+      log(`enrichment unavailable (${e.message}) — writing locations without it.`);
+    }
+  }
+
   const chargers = [];
-  const { sites, points } = await provider.normalizeStreaming({ locations: crawl.locations }, null, (c) => chargers.push(c));
+  const { sites, points } = await provider.normalizeStreaming(
+    { locations: crawl.locations, ...enrichment },
+    null,
+    (c) => chargers.push(c),
+  );
   log(`parsed ${sites} sites / ${points} points from ${crawl.locations.length} locations`);
   printSummary(summarize(chargers));
 
