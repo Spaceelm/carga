@@ -21,6 +21,7 @@
  */
 
 const { Redis } = require('@upstash/redis');
+const { CHARGER_STATUS } = require('./schema');
 
 const GEO_KEY = (cc) => `chargers:${cc.toLowerCase()}:geo`;
 const IDS_KEY = (cc) => `chargers:${cc.toLowerCase()}:ids`;
@@ -29,7 +30,9 @@ const CHARGER_KEY = (cc, id) => `charger:${cc.toLowerCase()}:${id}`;
 // Auxiliary indexes for the cheap status path (written at full refresh; stable
 // between refreshes). pointindex: refill-point id -> charger id (PT status diff).
 // coordindex: charger id -> [lat, lon] (ES marker-match sweep without MGET-all).
-// lastfeed: previous status feed (pointId -> status) — a delta cache, safe if lost.
+// lastfeed: previous status feed, compactly encoded against the pointindex order
+// (see "Last-feed snapshot" below) — a delta cache, internal to the ingest and safe
+// if lost: a missing or stale snapshot just costs one full-path run.
 const POINTINDEX_KEY = (cc) => `chargers:${cc.toLowerCase()}:pointindex`;
 const COORDINDEX_KEY = (cc) => `chargers:${cc.toLowerCase()}:coordindex`;
 const LASTFEED_KEY = (cc) => `chargers:${cc.toLowerCase()}:lastfeed`;
@@ -102,7 +105,16 @@ async function chunkedSet(redis, key, obj) {
  * object, or null when missing/corrupt — callers must treat null as "absent".
  */
 async function chunkedGet(redis, key) {
-  const base = await redis.get(key);
+  return chunkedGetFrom(redis, key, await redis.get(key));
+}
+
+/**
+ * chunkedGet for a base value the caller already has. The status path fetches
+ * meta + pointindex + lastfeed in ONE MGET, so the base bytes are in hand before
+ * we know whether they are a plain value or a `{__chunks:N}` sentinel; this
+ * resolves that without spending a second GET on the key we just read.
+ */
+async function chunkedGetFrom(redis, key, base) {
   if (base == null) return null;
   const parsed = typeof base === 'string' ? safeParse(base) : base;
   if (!parsed || typeof parsed !== 'object') return null;
@@ -119,6 +131,96 @@ async function chunkedGet(redis, key) {
     slices.push(typeof un === 'string' ? un : p);
   }
   return safeParse(slices.join(''));
+}
+
+// ---- Last-feed snapshot: compact, positional encoding -----------------------
+// The delta path needs "what was each refill point's status last run?". The old
+// shape was a plain `{pointId: status}` map — for FR that is ~60k ids x ~27 chars
+// ≈ 1.6 MB, which chunkedSet splits into several chunks. Chunk WRITES cannot be
+// batched into one MSET (each chunk is already sized against Upstash's ~1 MB
+// request cap), so that map cost ~5 commands to write and 2 to read on EVERY run
+// — the single largest fixed cost of a status run, and the thing that made a
+// 10-minute cadence unaffordable.
+//
+// The ids are pure redundancy: the point index we already read enumerates exactly
+// the same points. So store statuses POSITIONALLY against the point index's key
+// order — one character per point. FR's ~165k points become a ~165k-char string:
+// one plain SET, one plain GET, never chunked.
+//
+// Positional means the order must match. `g` is a fingerprint of the point-index
+// key list; a full refresh rebuilds the index, the fingerprint changes, and the
+// snapshot is rejected as unusable -> the run takes the always-correct full path
+// and rewrites it. Losing a snapshot is never a correctness problem, only a cost
+// one, so a conservative mismatch is exactly the right failure mode.
+const LASTFEED_VERSION = 2;
+const STATUS_TO_CODE = Object.freeze({
+  [CHARGER_STATUS.AVAILABLE]: 'a',
+  [CHARGER_STATUS.CHARGING]: 'c',
+  [CHARGER_STATUS.OUT_OF_ORDER]: 'o',
+  [CHARGER_STATUS.PLANNED]: 'p',
+  [CHARGER_STATUS.REMOVED]: 'r',
+  [CHARGER_STATUS.UNKNOWN]: 'u',
+});
+const CODE_TO_STATUS = Object.freeze(
+  Object.fromEntries(Object.entries(STATUS_TO_CODE).map(([s, c]) => [c, s]))
+);
+
+/**
+ * FNV-1a over the point-index key list. Identifies "which set of points, in which
+ * order" cheaply enough to run every status run (~10 ms for FR's 165k keys).
+ * The length prefix makes a collision need both the same count and the same hash.
+ */
+function pointIndexFingerprint(pointIds) {
+  let h = 0x811c9dc5;
+  for (const id of pointIds) {
+    for (let i = 0; i < id.length; i++) {
+      h = Math.imul(h ^ id.charCodeAt(i), 0x01000193);
+    }
+    h = Math.imul(h ^ 0x2f, 0x01000193); // separator: ["ab","c"] must differ from ["a","bc"]
+  }
+  return `${pointIds.length}.${(h >>> 0).toString(16)}`;
+}
+
+/**
+ * Encode the current feed as one character per point, in `pointIds` order.
+ * Points the feed did not carry encode as "unknown" — which is exactly how the
+ * reader treated a missing entry in the old map shape, so the delta comparison
+ * is unchanged.
+ */
+function encodeLastFeed(pointIds, statusOf) {
+  let out = '';
+  for (const pointId of pointIds) out += STATUS_TO_CODE[statusOf(pointId)] || 'u';
+  return out;
+}
+
+/**
+ * Build a `(index) => status` reader over a stored snapshot, or null when the
+ * snapshot is missing, stale, or of an unusable shape (caller falls back to the
+ * full path). Accepts the legacy `{pointId: status}` map so the first run after
+ * deploy still takes the cheap path instead of forcing a full MGET-all sweep.
+ */
+function lastFeedReader(value, pointIds, fingerprint) {
+  if (!value || typeof value !== 'object') return null;
+  if (value.v === LASTFEED_VERSION) {
+    if (value.g !== fingerprint) return null; // point index was rebuilt
+    if (typeof value.s !== 'string' || value.s.length !== pointIds.length) return null;
+    return (i) => CODE_TO_STATUS[value.s[i]] || CHARGER_STATUS.UNKNOWN;
+  }
+  if (Number.isInteger(value.__chunks)) return null; // caller must resolve chunks first
+  return (i) => value[pointIds[i]] || CHARGER_STATUS.UNKNOWN; // legacy map
+}
+
+/** Wrap an encoded snapshot for storage. One plain SET — never chunked. */
+function lastFeedPayload(fingerprint, encoded) {
+  return JSON.stringify({ v: LASTFEED_VERSION, g: fingerprint, s: encoded });
+}
+
+/**
+ * True when a stored snapshot already holds exactly this encoding — the write is
+ * then pure waste. Quiet runs (night, or a feed that did not move) hit this.
+ */
+function lastFeedUnchanged(value, fingerprint, encoded) {
+  return !!value && value.v === LASTFEED_VERSION && value.g === fingerprint && value.s === encoded;
 }
 
 /**
@@ -311,5 +413,11 @@ module.exports = {
   makeRedis,
   chunkedSet,
   chunkedGet,
+  chunkedGetFrom,
+  pointIndexFingerprint,
+  encodeLastFeed,
+  lastFeedReader,
+  lastFeedPayload,
+  lastFeedUnchanged,
   keys: { GEO_KEY, IDS_KEY, META_KEY, CHARGER_KEY, POINTINDEX_KEY, COORDINDEX_KEY, LASTFEED_KEY, CRAWL_KEY, CRAWL_PAGE_KEY },
 };

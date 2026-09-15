@@ -21,7 +21,17 @@
  */
 
 const { getProvider } = require('./providers');
-const { writeChargers, makeRedis, keys, chunkedGet, chunkedSet } = require('./store');
+const {
+  writeChargers,
+  makeRedis,
+  keys,
+  chunkedGetFrom,
+  pointIndexFingerprint,
+  encodeLastFeed,
+  lastFeedReader,
+  lastFeedPayload,
+  lastFeedUnchanged,
+} = require('./store');
 const { CHARGER_STATUS } = require('./schema');
 
 // Availability history: 7 days x 24 hours = 168 UTC buckets, one byte each
@@ -240,21 +250,31 @@ async function runStatusOnly(provider, args, redisClient) {
 
   const redis = redisClient || makeRedis();
   const cc = args.country.toLowerCase();
-  const ids = await redis.smembers(keys.IDS_KEY(cc));
-  if (!ids || ids.length === 0) {
-    throw new Error(
-      `No existing charger ids in Redis for ${args.country}. Run a full refresh first (omit --status-only).`
-    );
-  }
 
   const nowTs = new Date();
   const BATCH = 200;
   const statusOf = (pointId) => ((pointId && statusById.get(pointId)) || {}).status || CHARGER_STATUS.UNKNOWN;
-  const feedSnapshot = () => {
-    const o = {};
-    for (const [pointId, v] of statusById.entries()) o[pointId] = (v && v.status) || CHARGER_STATUS.UNKNOWN;
-    return o;
-  };
+
+  // ---- One MGET for the whole status-path prologue --------------------------
+  // meta (the history gate), pointindex (point -> charger) and lastfeed (previous
+  // statuses) used to be three separate round trips, and the `ids` SET was read
+  // up-front even though only the full path consumes it. Upstash bills per
+  // command, so at a 10-minute cadence that prologue WAS the cost of a quiet run.
+  // One MGET returns all three; `ids` moved down to the full path that needs it.
+  const [metaRaw, pointIndexBase, lastFeedBase] = await redis.mget(
+    keys.META_KEY(cc),
+    keys.POINTINDEX_KEY(cc),
+    keys.LASTFEED_KEY(cc)
+  );
+  const meta = parseJson(metaRaw);
+
+  // Resolve the point index once — both paths need it (the delta path to find the
+  // changed chargers, the full path to write the next snapshot). Costs one extra
+  // MGET only while the index is large enough to be chunked, and nothing at all
+  // when it is absent.
+  const pointIndex = await chunkedGetFrom(redis, keys.POINTINDEX_KEY(cc), pointIndexBase);
+  const pointIds = pointIndex ? Object.keys(pointIndex) : null;
+  const pointGen = pointIds ? pointIndexFingerprint(pointIds) : null;
 
   // History is bucketed per UTC weekday+hour, so accumulate at most once per
   // history window — the frequent runs only patch status. `lastHistoryHour` in meta
@@ -266,29 +286,43 @@ async function runStatusOnly(provider, args, redisClient) {
   const histEvery = Math.max(1, Math.min(24, (provider.historyEveryHours | 0) || 1));
   const gatedHour = Math.floor(nowTs.getUTCHours() / histEvery) * histEvery;
   const hourStamp = `${nowTs.toISOString().slice(0, 11)}${String(gatedHour).padStart(2, '0')}`; // "YYYY-MM-DDTHH" (window-floored)
-  const meta = parseJson(await redis.get(keys.META_KEY(cc)));
   const accumulate = !meta || meta.lastHistoryHour !== hourStamp;
+
+  // Carried forward so the delta path can report/record the record count without
+  // spending an SMEMBERS on a set it otherwise never reads. `meta.count` is written
+  // by every full refresh and every status run, so it is normally present; the point
+  // index is an exact stand-in if it is not, because it maps every point of every
+  // charger. Never leave this null — `meta` is part of the contract the web app reads.
+  const knownCount = meta && Number.isFinite(meta.count)
+    ? meta.count
+    : (pointIndex ? new Set(Object.values(pointIndex)).size : 0);
 
   // ---- Fast delta path (no history this run): only touch records whose status
   // changed since the previous run. Needs the stable pointindex + the last-feed
   // snapshot; if either is missing we fall through to the full path (always correct).
-  // Both indexes may be chunked across keys (FR-sized feeds exceed Upstash's ~1 MB
-  // request cap); chunkedGet returns null on any inconsistency -> full path. ----
-  if (!accumulate) {
-    const pointIndex = await chunkedGet(redis, keys.POINTINDEX_KEY(cc));
-    const lastFeed = await chunkedGet(redis, keys.LASTFEED_KEY(cc));
-    if (pointIndex && lastFeed) {
+  // The point index may be chunked across keys (FR-sized feeds exceed Upstash's
+  // ~1 MB request cap); a null from chunkedGetFrom means "absent" -> full path. ----
+  if (!accumulate && pointIds) {
+    // The snapshot is normally a plain value (compact positional encoding, see
+    // store.js). A snapshot left over from the old map shape may still be chunked,
+    // so resolve that case before reading it.
+    let lastFeedValue = typeof lastFeedBase === 'string' ? parseJson(lastFeedBase) : lastFeedBase;
+    if (lastFeedValue && Number.isInteger(lastFeedValue.__chunks)) {
+      lastFeedValue = await chunkedGetFrom(redis, keys.LASTFEED_KEY(cc), lastFeedBase);
+    }
+    const prevAt = lastFeedReader(lastFeedValue, pointIds, pointGen);
+    if (prevAt) {
       const changedIds = new Set();
-      for (const [pointId, chargerId] of Object.entries(pointIndex)) {
-        // Normalize BOTH sides to a status string before comparing. The point index
-        // covers every point in the STATIC feed, but the snapshot only holds points
-        // the status feed actually carried, so an uncovered point reads `undefined`
-        // here while statusOf() reports "unknown". Comparing those directly marked
+      for (let i = 0; i < pointIds.length; i++) {
+        // Both sides normalize to a status string before comparing. The point index
+        // covers every point in the STATIC feed, but the feed only carries the points
+        // it actually reports, so an uncovered point must read "unknown" on BOTH
+        // sides. Comparing a raw `undefined` against statusOf()'s "unknown" marked
         // every uncovered point as changed on every run — for FR, where ~65% of
         // points have no dynamic row, that turned the delta path into a near-full
         // sweep forever. (Invisible for PT: MOBI.E covers essentially every point.)
-        const prev = lastFeed[pointId] || CHARGER_STATUS.UNKNOWN;
-        if (prev !== statusOf(pointId)) changedIds.add(chargerId);
+        const pointId = pointIds[i];
+        if (prevAt(i) !== statusOf(pointId)) changedIds.add(pointIndex[pointId]);
       }
       const changed = [...changedIds];
       let patched = 0;
@@ -320,20 +354,34 @@ async function runStatusOnly(provider, args, redisClient) {
         }
         if (Object.keys(updates).length > 0) await redis.mset(updates);
       }
-      await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
+      // One plain SET, and only when the feed actually moved — a quiet run (night,
+      // or an upstream that did not republish between polls) writes nothing here.
+      const encoded = encodeLastFeed(pointIds, statusOf);
+      if (!lastFeedUnchanged(lastFeedValue, pointGen, encoded)) {
+        await redis.set(keys.LASTFEED_KEY(cc), lastFeedPayload(pointGen, encoded));
+      }
       await redis.set(keys.META_KEY(cc), JSON.stringify({
         lastRun: nowTs.toISOString(),
-        count: ids.length,
+        count: knownCount,
         mode: 'status-delta',
         lastHistoryHour: meta ? meta.lastHistoryHour : null,
       }));
-      log(`delta: patched status on ${patched} record(s) (${changed.length} candidates, ${ids.length} total)`);
+      log(`delta: patched status on ${patched} record(s) (${changed.length} candidates, ${knownCount} total)`);
       return { upserted: patched, skipped: 0, swept: 0, dryRun: false, statuses: statusById.size };
     }
   }
 
   // ---- Full path: MGET-all, patch status, roll history when this is the hour's
   // first run, MSET only changed. Rebuilds the last-feed snapshot for the delta path. ----
+  // Only this path consumes the id set, so it is read here rather than in the
+  // prologue — the delta path above never spends the command.
+  const ids = await redis.smembers(keys.IDS_KEY(cc));
+  if (!ids || ids.length === 0) {
+    throw new Error(
+      `No existing charger ids in Redis for ${args.country}. Run a full refresh first (omit --status-only).`
+    );
+  }
+
   let patched = 0;
   for (let i = 0; i < ids.length; i += BATCH) {
     const slice = ids.slice(i, i + BATCH);
@@ -368,7 +416,14 @@ async function runStatusOnly(provider, args, redisClient) {
     if (Object.keys(updates).length > 0) await redis.mset(updates);
   }
 
-  await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
+  // Seed the snapshot the next delta run will read. Without a point index there is
+  // no order to encode against — and no delta path to serve either — so skip it
+  // rather than store a blob nothing can use.
+  if (pointIds) {
+    await redis.set(keys.LASTFEED_KEY(cc), lastFeedPayload(pointGen, encodeLastFeed(pointIds, statusOf)));
+  } else {
+    log('no point index — skipping the last-feed snapshot (next run takes the full path again)');
+  }
   await redis.set(keys.META_KEY(cc), JSON.stringify({
     lastRun: nowTs.toISOString(),
     count: ids.length,

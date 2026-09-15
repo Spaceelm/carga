@@ -26,21 +26,25 @@ on:
     # Full refresh (all countries) — daily 04:13 UTC, after MOBI.E's ~03:00 publish.
     # Refreshes PT static + OPC prices, runs the mark-and-sweep, advances the ES crawl.
     - cron: '13 4 * * *'
-    # Status-only refresh (PT) — every ~15 min, offset off the quarter-hours. The
-    # expensive MGET-all + history roll is gated to once per hour inside run.js; the
-    # other runs take the cheap delta path (~6 Redis commands), which is what makes
-    # this cadence affordable.
-    - cron: '7,22,37,52 * * * *'
+    # Status-only refresh (PT) — every 10 min, offset off the quarter-hours. The
+    # expensive MGET-all + history roll is gated to once per HOUR inside run.js, and
+    # that gate does not move with the cadence: the extra runs all take the cheap
+    # delta path (one MGET for the indexes, one MGET+MSET per 200 changed records,
+    # one SET). Faster polling also means fewer records change per run, so the
+    # per-day Redis cost is roughly flat — see the budget note in the README.
+    - cron: '2,12,22,32,42,52 * * * *'
     # Status-only sweep (ES) — hourly at :05 (staggered off the PT runs). The
     # availability history buckets per UTC hour, so sweeping more often would add no
     # resolution — only load on REVE.
     - cron: '5 * * * *'
-    # Status-only refresh (FR) — every 30 min at :11/:41. Half PT's rate on purpose:
-    # each run pulls the ~9 MB consolidated IRVE dynamique file (cheap) but FR has
-    # ~47k stations vs PT's ~8k, so the periodic MGET-all sweeps dominate the Upstash
-    # budget. The provider also widens its history window to 3h (historyEveryHours),
-    # which is what keeps this affordable — see the budget note in the README.
-    - cron: '11,41 * * * *'
+    # Status-only refresh (FR) — every 10 min. Each run pulls the ~9 MB consolidated
+    # IRVE dynamique file (cheap); the cost that matters is Redis, and FR has ~47k
+    # stations vs PT's ~8k. Two things keep this affordable: the history roll is
+    # gated to once per 3h (provider.historyEveryHours), so the MGET-all sweeps stay
+    # at 8/day no matter how often we poll; and the last-feed snapshot is a compact
+    # positional encoding (store.js) that reads and writes in ONE command instead of
+    # the handful the old chunked map cost on every run.
+    - cron: '8,18,28,38,48,58 * * * *'
     # Resumable ES full-crawl chunk — every 3h at :25. REVE /locations is rate-limited
     # (~5 req/hr) and crawled a few checkpointed pages per run; 3h advances the cycle
     # ~3x faster than before while staying inside that budget.
@@ -73,10 +77,17 @@ on:
 
 # NOTE: concurrency is declared PER JOB, not at workflow level, and is keyed by
 # COUNTRY. A single workflow-wide group serialized every country against every
-# other, and GitHub keeps only ONE pending run per group — so with 7-8 recurring
+# other, and GitHub keeps only ONE pending run per group — so with 13-14 recurring
 # runs an hour, a slow leg (FR full: 120 MB download + 165k-row parse) would hold
 # the group and let later arrivals cancel the queued PT status run. Each country's
 # keyspace is independent, so only same-country runs actually need serializing.
+#
+# That one-pending-run rule is also why the status jobs cap themselves below their
+# own cadence (timeout-minutes: 8 against a 10-minute cron). The one place it still
+# bites by design is the daily 04:13 full refresh, which shares its country's group:
+# a long PT/FR full leg will queue the status runs behind it and drop all but the
+# last. That is the intended trade — the full refresh is the more important job, it
+# writes fresher data than the status run it displaces, and it happens once a day.
 
 permissions:
   contents: read
@@ -159,15 +170,21 @@ jobs:
         run: node scripts/ingest/run.js --country=ES
 
   # ---------------------------------------------------------------------------
-  # Status-only refresh (PT) — every ~15 min (:07/:22/:37/:52), and manual dispatch when
-  # mode=status-only (which may target ES, routed to the REVE area sweep).
+  # Status-only refresh (PT) — every 10 min (:02/:12/:22/:32/:42/:52), and manual
+  # dispatch when mode=status-only (which may target ES, routed to the REVE area sweep).
   # ---------------------------------------------------------------------------
   status:
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '7,22,37,52 * * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '2,12,22,32,42,52 * * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'status-only')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Scheduled runs must finish inside their 10-minute slot: GitHub keeps only ONE
+    # pending run per concurrency group, so a job that outlives its own cadence lets
+    # each new arrival cancel the previous queued one — the schedule then silently
+    # degrades instead of failing loudly. Killing a stuck run at 8 min costs one
+    # cycle and nothing else. A manual dispatch may legitimately target ES (routed to
+    # the slower REVE area sweep), so it keeps the old headroom.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 8 || 20 }}
     concurrency:
       group: ingest-PT
       cancel-in-progress: false
@@ -221,16 +238,17 @@ jobs:
         run: node scripts/ingest/run.js --country=ES --status-only
 
   # ---------------------------------------------------------------------------
-  # Status-only refresh (FR) — every 30 min at :11/:41. Pulls the consolidated
+  # Status-only refresh (FR) — every 10 min (:08/:18/:28/:38/:48/:58). Pulls the consolidated
   # "IRVE dynamique" CSV (~9 MB, OCPI-fed via Gireve/QualiCharge) and patches
   # statuses by id_pdc_itinerance, same id-join shape as PT. Rows older than 24h
   # are ignored by the provider, so unmaintained producers read as "unknown"
   # rather than as a stale availability claim.
   # ---------------------------------------------------------------------------
   status_fr:
-    if: github.event_name == 'schedule' && github.event.schedule == '11,41 * * * *'
+    if: github.event_name == 'schedule' && github.event.schedule == '8,18,28,38,48,58 * * * *'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Must fit inside its 10-minute slot — see the note on the PT status job.
+    timeout-minutes: 8
     concurrency:
       group: ingest-FR
       cancel-in-progress: false

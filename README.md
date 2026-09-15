@@ -31,17 +31,75 @@ Set by the limits that actually bind (Actions minutes are free here):
 | Job | Cron (UTC) | Cadence |
 |---|---|---|
 | Full refresh (PT + ES + FR matrix) | `13 4 * * *` | daily, after MOBI.E's ~03:00 publish |
-| PT status | `7,22,37,52 * * * *` | every ~15 min |
+| PT status | `2,12,22,32,42,52 * * * *` | every 10 min |
 | ES status sweep | `5 * * * *` | hourly |
-| FR status | `11,41 * * * *` | every 30 min |
+| FR status | `8,18,28,38,48,58 * * * *` | every 10 min |
 | ES crawl chunk | `25 */3 * * *` | every 3 h |
 | Heartbeat | `47 3 1 * *` | monthly |
 
-Why not faster:
+Why PT and FR can run at 10 min:
 
-1. **Upstash 500k commands/month**, shared with the app's read path. Current ingest load ≈ 120k/month. The expensive `MGET`-all + history roll is gated to once per hour inside `run.js`; the other PT runs take a cheap delta path (~6 commands), which is what makes 15-min affordable.
-2. **Upstream politeness.** Every PT status run pulls MOBI.E's ~40 MB feed (~115 GB/month at this cadence). REVE's official API is documented at ~5 req/hr. Getting throttled or blocked upstream would break live availability in the app.
-3. **GitHub crons** have 5-min granularity and are queued 5–20 min late under load, so sub-15-min is unreliable anyway.
+**The expensive work is gated on wall-clock, not on cadence.** The `MGET`-all + history
+roll happens once per history window inside `run.js` — hourly for PT, every 3 h for FR
+(`provider.historyEveryHours`). That is 24 and 8 sweeps a day no matter how often the
+cron fires. Every other run takes the delta path.
+
+**And a faster poll makes each delta smaller.** Measured against the live FR feed, ~1.5%
+of rows change in 10 minutes vs ~4.0% in 30. Three times the runs, each patching about a
+third as many records, so the `MGET`/`MSET` work per day barely moves. The fixed
+per-run overhead is what had to come down — see below.
+
+Why not faster still:
+
+1. **Upstash 500k commands/month**, shared with the app's read path. Ingest sits around
+   120k/month; the optimizations below are what keep it there at 10 min.
+2. **Upstream politeness.** Every PT status run pulls MOBI.E's ~40 MB feed — ~180 GB/month
+   at this cadence. The feed republishes about every 5 minutes (its DATEX `publicationTime`
+   is typically 3–5 min old), so 10 min is already near the point of diminishing returns;
+   polling faster would mostly re-download bytes we have.
+3. **GitHub crons** have 5-min granularity and are queued 5–20 min late under load, so a
+   sub-10-min nominal cadence would not actually deliver sub-10-min data.
+4. **ES is deliberately left hourly** — see the note below. It is not a budget question.
+
+### Keeping a status run cheap
+
+A status run's cost is `fixed overhead + work proportional to what changed`. At 10 min the
+overhead term is what dominates, so it was cut from ~12 Redis commands to ~4:
+
+- **One `MGET` for the prologue.** `meta`, `pointindex` and `lastfeed` were three separate
+  `GET`s; they are now one round trip (`chunkedGetFrom` resolves a chunk sentinel from
+  bytes already in hand).
+- **No `SMEMBERS` on the delta path.** The id set is only consumed by the full path, so it
+  is read there instead of up front.
+- **A compact last-feed snapshot.** This was the big one. The snapshot used to be a
+  `{pointId: status}` map — ~1.6 MB for FR, which `chunkedSet` splits into several chunks,
+  and chunk *writes* cannot be batched into one `MSET` (each chunk is already sized against
+  Upstash's ~1 MB request cap). It cost ~5 commands to write and 2 to read on every run.
+  The ids in it were pure redundancy: the point index already enumerates the same points in
+  the same order. Statuses are now stored positionally, one character per point — FR's
+  ~165k points become a ~165k-char string: one plain `SET`, one plain `GET`, never chunked.
+  A fingerprint of the point-index key list is stored alongside; when a full refresh
+  rebuilds the index the fingerprint stops matching and the snapshot is rejected, so the run
+  takes the always-correct full path and re-seeds it. Losing a snapshot is only ever a cost
+  problem, never a correctness one.
+- **Quiet runs write nothing.** If the encoded snapshot is identical to the stored one, the
+  write is skipped entirely.
+
+Measured against a simulated keyspace (PT 8k stations / full feed coverage; FR 47k stations
+/ ~35% of points carrying a dynamic row), counting Redis **commands**, which is what Upstash
+bills:
+
+| | delta run | full (history) run | runs/day | cmds/day |
+|---|---|---|---|---|
+| PT before, 15 min | 12 | 86 | 96 | 2928 |
+| PT after, 10 min | **6** | 85 | 144 | **2760** (−6%) |
+| FR before, 30 min | 13 | 333 | 48 | 3184 |
+| FR after, 10 min | **6** | 331 | 144 | **3464** (+9%) |
+
+Net for the two countries: **+1.8% commands for 2–3x the polling rate**. A run where nothing
+changed at all costs 3 commands, down from 16. The absolute daily figures depend on the real
+station counts and how often statuses genuinely flip, so treat them as a ratio rather than a
+forecast — and watch the Upstash dashboard after the cadence change lands.
 
 The **heartbeat** matters: GitHub disables scheduled workflows in public repos after **60 days of no repository activity**. The monthly job commits a timestamp to reset that clock. If the crons ever go silent, check whether they were auto-disabled (the Actions tab shows a banner and re-enabling is one click).
 
@@ -108,13 +166,41 @@ to the always-correct full path.
 
 ### FR budget note
 
-FR runs status every 30 min (not 15) and rolls availability history every **3 hours**
-(`provider.historyEveryHours = 3`) instead of hourly. The history roll is the
-expensive part — it MGETs every station — and 47k stations hourly would dominate the
-500k/month Upstash budget on its own. `accumulateHistory` spreads each observation
-across the three hourly buckets the window covers, so the 7x24 profile has no gaps,
-just 3-hour resolution. Between rolls the cheap delta path touches only the charge
-points whose status actually changed.
+FR rolls availability history every **3 hours** (`provider.historyEveryHours = 3`)
+instead of hourly. The history roll is the expensive part — it MGETs every station —
+and 47k stations hourly would dominate the 500k/month Upstash budget on its own.
+`accumulateHistory` spreads each observation across the three hourly buckets the
+window covers, so the 7x24 profile has no gaps, just 3-hour resolution. Between rolls
+the cheap delta path touches only the charge points whose status actually changed.
+
+This gate is why FR can poll at the same 10 min as PT while rolling history 3x less
+often: the cadence controls how fresh `status` is, `historyEveryHours` controls how
+often the costly sweep runs, and the two are independent.
+
+One caveat worth knowing when reading the data: only about half of the ~121k rows in
+the dynamique file carry a timestamp inside `STALE_HOURS` (24 h). The rest are dropped
+by the provider and read as "unknown" rather than as a stale availability claim, so a
+faster cadence does not widen coverage — it only sharpens the subset that is genuinely
+live.
+
+### Why ES is not on 10 minutes
+
+ES is the one country where the cadence is not a budget decision, and `runAreaStatus`
+in `providers/reve.js` should not simply be re-pointed at a faster cron:
+
+1. **It has no history gate.** It calls `accumulateHistory` unconditionally on every
+   matched record. History buckets are per UTC hour, so six runs an hour would EWMA six
+   observations into the same bucket; at `HISTORY_ALPHA = 0.25` the prior value keeps
+   only `0.75⁶ ≈ 18%` of its weight and the week-long profile collapses into "whatever
+   the last hour looked like". This fails silently — the map just starts showing wrong
+   typical-availability.
+2. **It has no delta path.** Every run is a full MGET + MSET over all matched stations.
+3. **Request volume.** REVE has no bulk status feed, so each sweep is one POST per
+   populated ~28 km tile. Six sweeps an hour against an undocumented public endpoint is
+   the most likely way to get blocked — and `fetchReveStatus` swallows failures, so
+   being throttled would surface as chargers quietly going "unknown", not as a red run.
+
+Fixing (1) is worth doing on its own merits regardless of cadence.
 
 ## Shared file: `netlify/functions/_reve.js`
 
