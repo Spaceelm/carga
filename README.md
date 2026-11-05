@@ -1,8 +1,8 @@
 # carga-ingest
 
-Scheduled ingest of national EV-charger feeds into Upstash Redis, for the [carga](https://github.com/Spaceelm/carregar-WEB) web app.
+Scheduled ingest of national EV-charger feeds into Upstash Redis, for the carga web app.
 
-This runs on GitHub Actions. It lives in its own **public** repo because Actions minutes are free and unmetered for public repositories — the app repo is private and was hitting the 2,000 min/month Free-plan cap (minutes are pooled per account, so moving to another *private* repo would not have helped).
+This runs on GitHub Actions. 
 
 ## What it does
 
