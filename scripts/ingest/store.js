@@ -40,7 +40,82 @@ const LASTFEED_KEY = (cc) => `chargers:${cc.toLowerCase()}:lastfeed`;
 const CRAWL_KEY = (cc) => `chargers:${cc.toLowerCase()}:crawl`;
 const CRAWL_PAGE_KEY = (cc, n) => `chargers:${cc.toLowerCase()}:crawl:page:${n}`;
 
-const PIPELINE_BATCH = 200; // records per pipeline flush
+// ---- Batch sizing (the Upstash command budget) -------------------------------
+// Upstash bills a multi-key command (MGET, MSET, GEOADD, SADD, ZREM, DEL) as ONE
+// command no matter how many keys it carries; what's capped is the ~1 MB REQUEST
+// body. Key-only commands (MGET/DEL/ZREM/SADD/GEOADD) carry tiny bodies, so they
+// batch at KEY_BATCH. MSET carries the record JSON, so it flushes by request size
+// (see makeMsetWriter) instead of a fixed record count. Both are env-tunable in
+// case a provider's records grow (or a response-size limit ever bites).
+// Previously everything batched at 200, which made batch COUNT — not data — the
+// dominant cost of every history roll and full refresh.
+const KEY_BATCH = Math.max(1, parseInt(process.env.INGEST_KEY_BATCH || '', 10) || 1000);
+// Measured on the doubly-escaped size (value JSON-encoded again inside the REST
+// command), same reasoning as CHUNK_CHARS below. 700k leaves headroom under ~1 MB.
+const MSET_MAX_BYTES = Math.max(1000, parseInt(process.env.INGEST_MSET_MAX_BYTES || '', 10) || 700000);
+
+/**
+ * Accumulates key->string pairs and issues one MSET whenever the next pair would
+ * push the request body past MSET_MAX_BYTES. A single oversized record is still
+ * sent on its own. Call flush() at the end.
+ */
+function makeMsetWriter(redis, maxBytes = MSET_MAX_BYTES) {
+  let buf = {};
+  let bytes = 0;
+  let n = 0;
+  let written = 0;
+  const flush = async () => {
+    if (n === 0) return;
+    await redis.mset(buf);
+    written += n;
+    buf = {};
+    bytes = 0;
+    n = 0;
+  };
+  const add = async (key, value) => {
+    const sz = JSON.stringify(key).length + JSON.stringify(value).length + 2;
+    if (n > 0 && bytes + sz > maxBytes) await flush();
+    buf[key] = value;
+    bytes += sz;
+    n++;
+  };
+  return { add, flush, get written() { return written; } };
+}
+
+// ---- Usage accounting -------------------------------------------------------
+// Every client built by makeRedis() is wrapped so each run can report exactly how
+// many Upstash commands it spent and roughly how many bytes it moved (request
+// args + response, JSON-serialized — close to what the REST API transfers).
+const stats = { commands: 0, bytesOut: 0, bytesIn: 0, byCommand: {} };
+
+function approxBytes(v) {
+  if (v == null) return 0;
+  if (typeof v === 'string') return v.length;
+  try { return JSON.stringify(v).length; } catch (_e) { return 0; }
+}
+
+function instrument(client) {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      const val = Reflect.get(target, prop, receiver);
+      if (typeof val !== 'function' || typeof prop !== 'string' || prop.startsWith('_')) return val;
+      // Only plain command methods are counted; pipelines/multi are not used here.
+      if (prop === 'pipeline' || prop === 'multi' || prop === 'constructor') return val.bind(target);
+      return async (...args) => {
+        stats.commands++;
+        stats.byCommand[prop] = (stats.byCommand[prop] || 0) + 1;
+        stats.bytesOut += approxBytes(args);
+        const res = await val.apply(target, args);
+        stats.bytesIn += approxBytes(res);
+        return res;
+      };
+    },
+  });
+}
+
+function redisStats() {
+  return { ...stats, byCommand: { ...stats.byCommand } };
+}
 
 // ---- Chunked JSON values ----------------------------------------------------
 // Upstash's REST API rejects requests over ~1 MB. PT's indexes fit comfortably,
@@ -133,7 +208,7 @@ function makeRedis() {
       'Missing Upstash credentials: set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.'
     );
   }
-  return new Redis({ url, token });
+  return instrument(new Redis({ url, token }));
 }
 
 /**
@@ -195,8 +270,8 @@ async function writeChargers(chargers, opts) {
   // rebuilds the record wholesale.)
   if (!statusOnly) {
     const incoming = chargers.filter((c) => isFinite(c.lat) && isFinite(c.lon));
-    for (let i = 0; i < incoming.length; i += PIPELINE_BATCH) {
-      const slice = incoming.slice(i, i + PIPELINE_BATCH);
+    for (let i = 0; i < incoming.length; i += KEY_BATCH) {
+      const slice = incoming.slice(i, i + KEY_BATCH);
       const existing = await redis.mget(...slice.map((c) => CHARGER_KEY(cc, String(c.id))));
       for (let k = 0; k < slice.length; k++) {
         const raw = existing[k];
@@ -227,15 +302,14 @@ async function writeChargers(chargers, opts) {
   // ---- Phase 1: upsert in batches ----
   // GEOADD accepts many members in one call and MSET writes many keys in one call;
   // Upstash bills each as ONE command (vs one GEOADD + one SET per charger). A full
-  // refresh of ~14k chargers thus costs a few hundred commands instead of ~28k.
+  // refresh of ~14k chargers thus costs a few dozen commands instead of ~28k.
+  // GEOADD batches by member count (tiny bodies); MSET flushes by request size.
   let geoMembers = []; // { longitude, latitude, member }
-  let jsonUpdates = {}; // CHARGER_KEY -> json string
-  const flush = async () => {
+  const jsonWriter = makeMsetWriter(redis);
+  const flushGeo = async () => {
     if (geoMembers.length === 0) return;
     await redis.geoadd(GEO_KEY(cc), ...geoMembers);
-    await redis.mset(jsonUpdates);
     geoMembers = [];
-    jsonUpdates = {};
   };
 
   for (const c of chargers) {
@@ -244,12 +318,13 @@ async function writeChargers(chargers, opts) {
     currentIds.add(id);
 
     geoMembers.push({ longitude: c.lon, latitude: c.lat, member: id });
-    jsonUpdates[CHARGER_KEY(cc, id)] = JSON.stringify(c);
+    await jsonWriter.add(CHARGER_KEY(cc, id), JSON.stringify(c));
     upserted++;
 
-    if (geoMembers.length >= PIPELINE_BATCH) await flush();
+    if (geoMembers.length >= KEY_BATCH) await flushGeo();
   }
-  await flush();
+  await flushGeo();
+  await jsonWriter.flush();
 
   // ---- Phase 2: bookkeeping + mark-and-sweep (full refresh only) ----
   let swept = 0;
@@ -259,8 +334,8 @@ async function writeChargers(chargers, opts) {
 
     if (staleIds.length > 0) {
       // Multi-key ZREM + DEL: one command each per batch, not one per stale id.
-      for (let i = 0; i < staleIds.length; i += PIPELINE_BATCH) {
-        const chunk = staleIds.slice(i, i + PIPELINE_BATCH);
+      for (let i = 0; i < staleIds.length; i += KEY_BATCH) {
+        const chunk = staleIds.slice(i, i + KEY_BATCH);
         await redis.zrem(GEO_KEY(cc), ...chunk);
         await redis.del(...chunk.map((id) => CHARGER_KEY(cc, id)));
       }
@@ -270,8 +345,8 @@ async function writeChargers(chargers, opts) {
     // Rewrite the ids set to exactly the current ids.
     await redis.del(IDS_KEY(cc));
     const idArr = [...currentIds];
-    for (let i = 0; i < idArr.length; i += PIPELINE_BATCH) {
-      await redis.sadd(IDS_KEY(cc), ...idArr.slice(i, i + PIPELINE_BATCH));
+    for (let i = 0; i < idArr.length; i += KEY_BATCH) {
+      await redis.sadd(IDS_KEY(cc), ...idArr.slice(i, i + KEY_BATCH));
     }
   }
 
@@ -311,5 +386,9 @@ module.exports = {
   makeRedis,
   chunkedSet,
   chunkedGet,
+  makeMsetWriter,
+  redisStats,
+  instrument,
+  KEY_BATCH,
   keys: { GEO_KEY, IDS_KEY, META_KEY, CHARGER_KEY, POINTINDEX_KEY, COORDINDEX_KEY, LASTFEED_KEY, CRAWL_KEY, CRAWL_PAGE_KEY },
 };

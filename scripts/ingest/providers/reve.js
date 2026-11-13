@@ -537,7 +537,9 @@ async function runAreaStatus(redis, helpers) {
   const { keys, accumulateHistory, log = () => {}, dryRun = false } = helpers;
   const cc = COUNTRY.toLowerCase();
   const { fetchReveStatus, reveStatusToOcpi } = require('../../../netlify/functions/_reve');
-  const BATCH = 200;
+  // MGET slice size from store.js (Upstash bills a multi-key command as ONE command);
+  // MSETs flush by request size via makeMsetWriter.
+  const { KEY_BATCH: BATCH, makeMsetWriter } = require('../store');
 
   // Coord source: prefer the coordindex blob (1 GET, seeded by the full refresh);
   // else MGET-all records once (fallback) and cache them for write-back.
@@ -625,6 +627,7 @@ async function runAreaStatus(redis, helpers) {
   const now = new Date();
   const matchedIds = [...desired.keys()];
   let written = 0;
+  const writer = makeMsetWriter(redis);
   for (let i = 0; i < matchedIds.length; i += BATCH) {
     const slice = matchedIds.slice(i, i + BATCH);
     const need = slice.filter((id) => !recordCache.has(id));
@@ -632,7 +635,6 @@ async function runAreaStatus(redis, helpers) {
       const jsons = await redis.mget(...need.map((id) => keys.CHARGER_KEY(cc, id)));
       need.forEach((id, k) => { const r = parseJson(jsons[k]); if (r) recordCache.set(id, r); });
     }
-    const updates = {};
     for (const id of slice) {
       const rec = recordCache.get(id);
       if (!rec) continue;
@@ -648,10 +650,10 @@ async function runAreaStatus(redis, helpers) {
       }
       const histChanged = accumulateHistory(rec, now);
       if (ch) rec.lastUpdated = new Date().toISOString();
-      if (ch || histChanged) { updates[keys.CHARGER_KEY(cc, id)] = JSON.stringify(rec); written++; }
+      if (ch || histChanged) { await writer.add(keys.CHARGER_KEY(cc, id), JSON.stringify(rec)); written++; }
     }
-    if (Object.keys(updates).length) await redis.mset(updates);
   }
+  await writer.flush();
 
   await redis.set(
     keys.META_KEY(cc),

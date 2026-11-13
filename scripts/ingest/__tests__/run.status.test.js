@@ -26,6 +26,7 @@ function makeFakeRedis(seed) {
     _store: store,
     _calls: calls,
     async smembers(k) { calls.smembers++; return store.get(k) || []; },
+    async scard(k) { calls.scard = (calls.scard || 0) + 1; return (store.get(k) || []).length; },
     async mget(...ks) { calls.mget++; calls.mgetKeys += ks.length; return ks.map((k) => (store.has(k) ? store.get(k) : null)); },
     async mset(obj) { calls.mset++; for (const [k, v] of Object.entries(obj)) store.set(k, v); },
     async get(k) { calls.get++; return store.has(k) ? store.get(k) : null; },

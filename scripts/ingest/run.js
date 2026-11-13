@@ -21,7 +21,9 @@
  */
 
 const { getProvider } = require('./providers');
-const { writeChargers, makeRedis, keys, chunkedGet, chunkedSet } = require('./store');
+const {
+  writeChargers, makeRedis, keys, chunkedGet, chunkedSet, makeMsetWriter, redisStats, KEY_BATCH,
+} = require('./store');
 const { CHARGER_STATUS } = require('./schema');
 
 // Availability history: 7 days x 24 hours = 168 UTC buckets, one byte each
@@ -240,15 +242,18 @@ async function runStatusOnly(provider, args, redisClient) {
 
   const redis = redisClient || makeRedis();
   const cc = args.country.toLowerCase();
-  const ids = await redis.smembers(keys.IDS_KEY(cc));
-  if (!ids || ids.length === 0) {
+  // SCARD, not SMEMBERS: the delta path only needs the count, and SMEMBERS on FR
+  // (~47k ids) downloaded the whole set every 30 min for nothing. The full path
+  // fetches the members itself below.
+  const idCount = Number(await redis.scard(keys.IDS_KEY(cc))) || 0;
+  if (idCount === 0) {
     throw new Error(
       `No existing charger ids in Redis for ${args.country}. Run a full refresh first (omit --status-only).`
     );
   }
 
   const nowTs = new Date();
-  const BATCH = 200;
+  const BATCH = KEY_BATCH; // MGET slice size; MSETs flush by request size (makeMsetWriter)
   const statusOf = (pointId) => ((pointId && statusById.get(pointId)) || {}).status || CHARGER_STATUS.UNKNOWN;
   const feedSnapshot = () => {
     const o = {};
@@ -292,10 +297,10 @@ async function runStatusOnly(provider, args, redisClient) {
       }
       const changed = [...changedIds];
       let patched = 0;
+      const writer = makeMsetWriter(redis);
       for (let i = 0; i < changed.length; i += BATCH) {
         const slice = changed.slice(i, i + BATCH);
         const jsons = await redis.mget(...slice.map((id) => keys.CHARGER_KEY(cc, id)));
-        const updates = {};
         for (let j = 0; j < slice.length; j++) {
           const charger = parseJson(jsons[j]);
           if (!charger) continue;
@@ -315,31 +320,35 @@ async function runStatusOnly(provider, args, redisClient) {
           if (ch) {
             charger.lastUpdated = new Date().toISOString();
             patched++;
-            updates[keys.CHARGER_KEY(cc, slice[j])] = JSON.stringify(charger);
+            await writer.add(keys.CHARGER_KEY(cc, slice[j]), JSON.stringify(charger));
           }
         }
-        if (Object.keys(updates).length > 0) await redis.mset(updates);
       }
+      await writer.flush();
       await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
       await redis.set(keys.META_KEY(cc), JSON.stringify({
         lastRun: nowTs.toISOString(),
-        count: ids.length,
+        count: idCount,
         mode: 'status-delta',
         lastHistoryHour: meta ? meta.lastHistoryHour : null,
       }));
-      log(`delta: patched status on ${patched} record(s) (${changed.length} candidates, ${ids.length} total)`);
+      log(`delta: patched status on ${patched} record(s) (${changed.length} candidates, ${idCount} total)`);
       return { upserted: patched, skipped: 0, swept: 0, dryRun: false, statuses: statusById.size };
     }
   }
 
   // ---- Full path: MGET-all, patch status, roll history when this is the hour's
   // first run, MSET only changed. Rebuilds the last-feed snapshot for the delta path. ----
+  // A path that skips the delta logs why, so a run that falls back here when it
+  // shouldn't (missing/corrupt index) is visible in the Actions log.
+  if (!accumulate) log('delta path unavailable (point index or last-feed missing) — falling back to full path');
+  const ids = (await redis.smembers(keys.IDS_KEY(cc))) || [];
   let patched = 0;
+  const writer = makeMsetWriter(redis);
   for (let i = 0; i < ids.length; i += BATCH) {
     const slice = ids.slice(i, i + BATCH);
     const jsons = await redis.mget(...slice.map((id) => keys.CHARGER_KEY(cc, id)));
 
-    const updates = {}; // key -> JSON string, flushed in a single MSET
     for (let j = 0; j < slice.length; j++) {
       const charger = parseJson(jsons[j]);
       if (!charger) continue;
@@ -362,11 +371,11 @@ async function runStatusOnly(provider, args, redisClient) {
 
       if (changed) { charger.lastUpdated = new Date().toISOString(); patched++; }
       if (changed || histChanged) {
-        updates[keys.CHARGER_KEY(cc, slice[j])] = JSON.stringify(charger);
+        await writer.add(keys.CHARGER_KEY(cc, slice[j]), JSON.stringify(charger));
       }
     }
-    if (Object.keys(updates).length > 0) await redis.mset(updates);
   }
+  await writer.flush();
 
   await chunkedSet(redis, keys.LASTFEED_KEY(cc), feedSnapshot());
   await redis.set(keys.META_KEY(cc), JSON.stringify({
@@ -421,10 +430,34 @@ async function main() {
       ? await runStatusOnly(provider, args)
       : await runFull(provider, args);
     log(`done in ${((Date.now() - started) / 1000).toFixed(1)}s`, JSON.stringify(res));
+    reportUsage(args, 'ok');
     process.exit(0);
   } catch (e) {
     errlog('FAILED — aborting without destructive write:', e.stack || e.message);
+    reportUsage(args, 'failed');
     process.exit(1);
+  }
+}
+
+/**
+ * Print this run's Upstash usage (commands + approx bytes) and, on GitHub Actions,
+ * append a one-row table to the job summary. Grep the logs for "[ingest] upstash:"
+ * to total usage per job type over a day and compare with the console graph.
+ */
+function reportUsage(args, outcome) {
+  const s = redisStats();
+  const mb = (n) => (n / 1e6).toFixed(2);
+  const mode = args.statusOnly ? 'status-only' : 'full';
+  const by = Object.entries(s.byCommand).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ');
+  log(`upstash: country=${args.country} mode=${mode} outcome=${outcome} commands=${s.commands} sentMB=${mb(s.bytesOut)} recvMB=${mb(s.bytesIn)} ${by}`);
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary) {
+    try {
+      require('fs').appendFileSync(summary,
+        '| country | mode | outcome | commands | sent MB | recv MB | by command |\n' +
+        '|---|---|---|---|---|---|---|\n' +
+        `| ${args.country} | ${mode} | ${outcome} | ${s.commands} | ${mb(s.bytesOut)} | ${mb(s.bytesIn)} | ${by} |\n`);
+    } catch (_e) { /* summary is best-effort */ }
   }
 }
 
