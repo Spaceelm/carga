@@ -158,6 +158,75 @@ function coverageTracker() {
   };
 }
 
+// ---------------------------------------------------------------------------------
+// Network membership: is a station on the MOBI.E network?
+//
+// The DATEX feed lists every public charger in Portugal, including networks outside
+// MOBI.E (Continente, Tesla, High Green Power...). A CEME card only works on the MOBI.E
+// network, so the app must know which is which or it prices CEME cards at stations
+// where no driver can use them. MOBI.E's own station list says so per station.
+//   https://data.mobie.pt/data/stations.json
+//   { stations: [{ name: 'LSB-00538', partyId, mobieNetwork: true,
+//                  sockets: [{ evse: 'LSB-00538-01', ... }] }] }
+// ---------------------------------------------------------------------------------
+
+const STATIONS_URL = 'https://data.mobie.pt/data/stations.json';
+const MIN_LISTED = 5000; // ~8,800 in Nov 2026
+
+/** station key / socket id -> mobieNetwork. Throws on a file that is not the list. */
+function parseStations(json) {
+  const j = typeof json === 'string' ? JSON.parse(json) : json;
+  const list = j && Array.isArray(j.stations) ? j.stations : null;
+  if (!list || list.length < MIN_LISTED) throw new Error(`stations.json lists ${list ? list.length : 0} stations`);
+  const byKey = new Map();
+  for (const s of list) {
+    if (typeof s.mobieNetwork !== 'boolean') continue;
+    if (s.name) byKey.set(String(s.name).trim().toUpperCase(), s.mobieNetwork);
+    for (const k of s.sockets || []) {
+      const evse = String(k.evse || '').trim().toUpperCase();
+      if (!evse) continue;
+      byKey.set(evse, s.mobieNetwork);
+      const station = evse.replace(/-\d+$/, '');
+      if (station !== evse && !byKey.has(station)) byKey.set(station, s.mobieNetwork);
+    }
+  }
+  return { byKey, listed: list.length };
+}
+
+/**
+ * true / false when MOBI.E lists the site, null when it does not (unknown: the app
+ * then keeps pricing as before rather than hide a price on a guess). Tried in order:
+ * each plug's MOBI.E station (from its EVSE id), its point id, then the site id
+ * without its operator prefix ("CNT-A0104PL0001" -> "A0104PL0001").
+ */
+function networkForSite(index, site, connectors) {
+  if (!index) return null;
+  const get = (k) => (k ? index.byKey.get(String(k).trim().toUpperCase()) : undefined);
+  for (const c of connectors || []) {
+    const pk = plugKey(c.evseId, c.pointId);
+    for (const v of [pk && get(pk.station), get(c.pointId)]) if (typeof v === 'boolean') return v;
+  }
+  for (const id of [site.id, site.externalIdentifier]) {
+    if (!id) continue;
+    for (const v of [get(id), get(String(id).replace(/^[A-Z0-9]{3}-/i, ''))]) if (typeof v === 'boolean') return v;
+  }
+  return null;
+}
+
+async function fetchStations(nodeFetch, userAgent) {
+  try {
+    const res = await nodeFetch(STATIONS_URL, { headers: { 'User-Agent': userAgent, Accept: 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const type = res.headers.get('content-type') || '';
+    if (!/json/i.test(type)) throw new Error(`expected JSON, got ${type || 'no content type'}`);
+    return parseStations(await res.text());
+  } catch (e) {
+    feeError(`station list download failed (${e.message}); stations are written WITHOUT the MOBI.E network flag`);
+    return null;
+  }
+}
+
 module.exports = {
   TARIFFS_URL, MIN_COVERAGE, parseTariffs, plugKey, setIndexFor, opcFromSet, opcForPlug, fetchTariffs, coverageTracker,
+  STATIONS_URL, parseStations, networkForSite, fetchStations,
 };

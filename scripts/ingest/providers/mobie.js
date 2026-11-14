@@ -37,10 +37,14 @@ const STATUS_URL = 'https://pgm.mobie.pt/integration/nap/evActualStatus';
 const USER_AGENT = 'carga-live-web/1.0';
 const COUNTRY = 'PT';
 const SOURCE = 'mobie';
-const { fetchTariffs, opcForPlug, coverageTracker } = require('./mobie-tariffs');
+const { fetchTariffs, opcForPlug, coverageTracker, fetchStations, networkForSite } = require('./mobie-tariffs');
 // Fee index for the current full run (null on a status-only run or a failed download),
 // and the plugs-priced counter it reports. Module-level so run.js keeps its signature.
 let feeIndex = null;
+// MOBI.E's own station list: which sites are on the MOBI.E network (CEME cards work
+// only there). null on a status-only run or a failed download.
+let networkIndex = null;
+const networkTally = { mobie: 0, other: 0, unknown: 0 };
 let feeCoverage = null;
 
 /** Strip an XML namespace prefix ("ns6:foo" -> "foo"). */
@@ -235,6 +239,8 @@ function finalizeSite(site) {
     }
     feeCoverage.count(connectors);
   }
+  const mobieNetwork = networkForSite(networkIndex, site, connectors);
+  if (networkIndex) networkTally[mobieNetwork === true ? 'mobie' : mobieNetwork === false ? 'other' : 'unknown']++;
   return {
     id: site.id || site.externalIdentifier || `${site.lat}_${site.lon}`,
     country: COUNTRY,
@@ -250,6 +256,9 @@ function finalizeSite(site) {
     capabilities,
     connectors,
     tariff: null,
+    // true: on the MOBI.E network; false: listed by MOBI.E as outside it (Continente,
+    // Tesla...); absent: not known. The app prices CEME cards only where it is true or absent.
+    ...(mobieNetwork != null ? { mobieNetwork } : {}),
     status: aggregate,
     lastUpdated: site.lastUpdated || new Date().toISOString(),
   };
@@ -291,6 +300,7 @@ async function fetch(opts = {}) {
     // charger data is still written: stations must not go stale over a fee problem.
     feeIndex = await fetchTariffs(nodeFetch, USER_AGENT);
     feeCoverage = coverageTracker();
+    networkIndex = await fetchStations(nodeFetch, USER_AGENT);
   }
 
   return { staticStream, statusStream };
@@ -511,6 +521,7 @@ function buildStaticState(statusById, onCharger, parser, resolve, reject) {
   parser.on('error', reject);
   parser.on('end', () => {
     if (feeIndex && feeCoverage) feeCoverage.report(feeIndex);
+    if (networkIndex) console.log(`mobie: network flag on ${networkTally.mobie} MOBI.E + ${networkTally.other} non-MOBI.E sites, ${networkTally.unknown} not listed`);
     resolve({ sites, points });
   });
 }
