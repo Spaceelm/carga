@@ -93,3 +93,28 @@ test('too few plugs priced fails the job; a normal run does not', () => {
     process.exitCode = before;
   }
 });
+
+// --- network membership --------------------------------------------------------------
+
+const STATIONS = { stations: [
+  ...[...Array(5000)].map((_, i) => ({ name: `ZZZ-${String(i).padStart(5, '0')}`, mobieNetwork: true, sockets: [] })),
+  { name: 'LSB-00538', mobieNetwork: true, sockets: [{ evse: 'LSB-00538-01' }] },
+  { name: 'A0104PL0001', operator: 'Continente', mobieNetwork: false, sockets: [{ evse: '254' }] },
+  { name: null, mobieNetwork: false, sockets: [{ evse: 'PTM-OCEANO-01' }] },
+  { name: 'X-NOFLAG', sockets: [] },
+] };
+
+test('network flag: from the plug, the point id, or the site id without its operator prefix', () => {
+  const idx = T.parseStations(STATIONS);
+  assert.strictEqual(T.networkForSite(idx, { id: 'GLP-LSB-00538' }, [{ evseId: 'PT*GLP*ELSB*00538*01' }]), true);
+  assert.strictEqual(T.networkForSite(idx, { id: 'CNT-A0104PL0001' }, [{ evseId: 'PT*CNT*EA0104PL0001*1' }]), false, 'Continente: outside MOBI.E');
+  assert.strictEqual(T.networkForSite(idx, { id: 'HGP-X' }, [{ evseId: 'PT*HGP*E184', pointId: 'PTM-OCEANO-01' }]), false);
+  assert.strictEqual(T.networkForSite(idx, { id: 'EDP-ALM-99999' }, [{ evseId: 'PT*EDP*EALM*99999*1' }]), null, 'not listed: unknown, never a guess');
+  assert.strictEqual(T.networkForSite(idx, { id: 'ABC-X-NOFLAG' }, []), null, 'listed without a flag: unknown');
+  assert.strictEqual(T.networkForSite(null, { id: 'GLP-LSB-00538' }, []), null);
+});
+
+test('a station list that is not the list is refused', () => {
+  assert.throws(() => T.parseStations('<html></html>'));
+  assert.throws(() => T.parseStations({ stations: [{ name: 'A', mobieNetwork: true }] }), /lists 1 stations/);
+});

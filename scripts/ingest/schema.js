@@ -42,6 +42,7 @@
  * @property {string|null} [parkingType]  OCPI parking_type (e.g. "ON_STREET","PARKING_GARAGE"), or null.
  * @property {Connector[]} connectors  All connectors / refill points at this site.
  * @property {Object|null} tariff  Raw tariff hint (currency, pricingPolicy, minimumDeliveryFee) or null.
+ * @property {boolean} [mobieNetwork]  PT only: true when MOBI.E lists the site on its network, false when it lists it outside (Continente, Tesla...). Absent when MOBI.E does not list it. CEME cards work only on the MOBI.E network.
  * @property {string} status    Aggregate site status (see ChargerStatus).
  * @property {string} lastUpdated ISO timestamp of the freshest update at this site.
  *
