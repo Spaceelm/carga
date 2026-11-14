@@ -13,7 +13,7 @@
  *   "Type 2" (AC), "CCS" (DC), "CHAdeMO" (DC), "Type 1", "Tesla", "Type 3", "Unknown".
  * @property {string} format    Physical format. MOBI.E: "socket" | "cableMode3" | "unknown"; REVE (OCPI): "SOCKET" | "CABLE". Consumers normalize case-insensitively (/socket/, /cable/).
  * @property {string|null} [chargingMode]  IEC 61851 charging mode when known (MOBI.E): "mode2AC1p" | "mode3AC3p" | "mode4DC" — carries AC phase count and AC/DC.
- * @property {{energy?:number,time?:number,flat?:number}} [opc]  Per-station operator fee (MOBI.E "Descarregar Tarifas" CSV, REGULAR): ENERGY €/kWh, TIME €/min, FLAT €/charge. Input to CEME community-pricing cards. Present only for matched PT stations.
+ * @property {{energy:number,time:number,flat:number,parts?:Array<{unit:"kWh"|"min"|"charge",price:number,after?:number,until?:number}>}} [opc]  Per-plug operator fee (MOBI.E open data, REGULAR plan). energy €/kWh, time €/min, flat €/charge are the components that apply all session; `parts` (only when some component has a time window) lists every component with its window in minutes since the session started. Input to CEME community-pricing cards. Present only for PT plugs MOBI.E publishes a fee for.
  * @property {number|null} powerKW  Max power at socket, kilowatts (W / 1000).
  * @property {number|null} voltage  Nominal voltage (V), or null.
  * @property {number|null} amperage Maximum current (A), or null.

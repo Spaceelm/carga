@@ -107,37 +107,6 @@ test('unit helpers: connector mapping, W->kW, status mapping', () => {
   assert.strictEqual(mobie._mapStatus('planned'), CHARGER_STATUS.PLANNED);
 });
 
-test('OPC CSV: parse (REGULAR only, station×posto components) + kw->posto + join', () => {
-  const CSV = [
-    'ID;UID_TOMADA;TIPO_POSTO;MUNICIPIO;MORADA;OPERADOR;MOBICHARGER;NIVELTENSAO;TIPO_TARIFARIO;TIPO_TARIFA;TARIFA;TIPO_TOMADA;FORMATO_TOMADA;POTENCIA_TOMADA',
-    'ABF-00008;PT-EDP-EABF-00008-1-1;Semirrápido;X;Y;EDP;m;BTE;REGULAR;ENERGY;€ 0.1 /kWh;T;SOCKET;22',
-    'ABF-00008;PT-EDP-EABF-00008-1-1;Semirrápido;X;Y;EDP;m;BTE;REGULAR;TIME;€ 0.015 /min;T;SOCKET;22',
-    'ABF-00008;PT-EDP-EABF-00008-1-1;Semirrápido;X;Y;EDP;m;BTE;REGULAR;FLAT;€ 0.261 /charge;T;SOCKET;22',
-    'ABF-00008;PT-EDP-EABF-00008-2-1;Rápido;X;Y;EDP;m;MT;REGULAR;ENERGY;€ 0.25 /kWh até 60 min;C;CABLE;50',
-    'ABF-00008;PT-EDP-EABF-00008-9-1;Semirrápido;X;Y;EDP;m;BTE;AD_HOC_PAYMENT;ENERGY;€ 0.9 /kWh;T;SOCKET;22',
-  ].join('\n');
-  const map = mobie._parseOpcCsv(CSV);
-
-  // keyed by both "OP-ID" and bare "ID"
-  const st = map.get('EDP-ABF-00008');
-  assert.ok(st, 'station keyed by OPERADOR-ID');
-  assert.ok(map.get('ABF-00008'), 'station also keyed by bare ID');
-  assert.deepStrictEqual(st['Semirrápido'], { energy: 0.1, time: 0.015, flat: 0.261 });
-  assert.strictEqual(st['Rápido'].energy, 0.25, 'conditional clause stripped to base rate');
-  // AD_HOC_PAYMENT ignored (0.9 never appears)
-  assert.ok(!JSON.stringify([...map.values()]).includes('0.9'), 'AD_HOC rows excluded');
-
-  assert.strictEqual(mobie._kwToPosto(3.7), 'Normal');
-  assert.strictEqual(mobie._kwToPosto(22), 'Semirrápido');
-  assert.strictEqual(mobie._kwToPosto(50), 'Rápido');
-  assert.strictEqual(mobie._kwToPosto(150), 'Ultrarrápido');
-
-  // join by power class, with fallback to any posto when the exact class is absent
-  assert.deepStrictEqual(mobie._opcForConnector(st, 22), { energy: 0.1, time: 0.015, flat: 0.261 });
-  assert.strictEqual(mobie._opcForConnector(st, 50).energy, 0.25);
-  assert.ok(mobie._opcForConnector(st, 3.7), 'no Normal tier -> falls back to a posto');
-});
-
 test('parseStatus() maps ids to statuses', async () => {
   const map = await mobie.parseStatus(statusXml);
   assert.strictEqual(map.size, 3);

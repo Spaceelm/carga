@@ -431,7 +431,9 @@ async function main() {
       : await runFull(provider, args);
     log(`done in ${((Date.now() - started) / 1000).toFixed(1)}s`, JSON.stringify(res));
     reportUsage(args, 'ok');
-    process.exit(0);
+    // A provider may flag a non-fatal data problem (e.g. MOBI.E fees missing) via
+    // process.exitCode: the data was written, but the job must show as failed.
+    process.exit(process.exitCode || 0);
   } catch (e) {
     errlog('FAILED — aborting without destructive write:', e.stack || e.message);
     reportUsage(args, 'failed');
